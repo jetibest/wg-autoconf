@@ -1,0 +1,418 @@
+#!/bin/bash
+# note: Origin of default prefix: wireguard = WireGuard = ['w', 'g'] = [119, 103] = [0x77, 0x67] = 7767::
+# note: The auth file (/etc/wireguard/<interface>.auth) contains passive manually entered data, hence it may not reflect the current configuration (use: wg show), and only provides authorization for a new client (not existing ones).
+# note: The client identifier (client_id) should be unguessable (random, long, and unique) for obvious security reasons
+
+WIREGUARD_PORT="51820"
+
+opts_interface="wg-autoconf"
+opts_ipv6_prefix="7767:0:0"
+opts_ipv6_subnet=":1"
+opts_ipv6_address="::1"
+opts_bind_host="0.0.0.0"
+opts_unique_identifier=""
+opts_persistent_keepalive_s="25"
+opts_verbosity="0"
+
+print_usage()
+{
+	echo "wg-autoconf: easy tool to setup wireguard in the typical client/server use case"
+	echo ""
+	echo "Usage:"
+	echo "  $0 [OPTIONS] <COMMAND>"
+	echo ""
+	echo "OPTIONS"
+	echo "  -i <interface>    Set name of the wireguard-interface."
+	echo "                    Defaults to: $opts_interface"
+	echo "  -v                Increase verbosity."
+	echo ""
+	echo "CONNECT OPTIONS"
+	echo "  -u <unique-id>    Set unique identifier as client. The server must first authorize clients by adding"
+	echo "                    their identifier to its authorization file (/etc/wireguard/<interface>.auth)."
+	echo "                    Defaults to the public key of the client."
+	echo "  -k <seconds>      Set persistent keepalive seconds."
+	echo "                    Defaults to: $opts_persistent_keepalive_s"
+	echo ""
+	echo "LISTEN OPTIONS"
+	echo "  -p <ipv6-prefix>  Set prefix of the virtual IPv6 network."
+	echo "                    Defaults to: $opts_ipv6_prefix"
+	echo "  -s <ipv6-subnet>  Set subnet of the virtual IPv6 network."
+	echo "                    Defaults to: $opts_ipv6_subnet"
+	echo "  -a <ipv6-address> Set address of the server in the virtual IPv6 network"
+	echo "                    Defaults to: $opts_ipv6_address"
+	echo "  -b <bind-host>    Set host to bind to."
+	echo "                    Defaults to: $opts_bind_host"
+	echo ""
+	echo "COMMANDS"
+	echo ""
+	echo "  connect <host> [port]"
+	echo ""
+	echo "      Connect to the given server running wg-autoconf listen."
+	echo "      Port defaults to 51820."
+	echo ""
+	echo "  listen [port]"
+	echo ""
+	echo "      Listen at the given TCP-port."
+	echo ""
+	echo ""
+}
+
+while [ "${1:0:1}" = "-" ]
+do
+	if [ "$1" = "--" ]
+	then
+		shift
+		break
+	
+	elif [ "$1" = "-i" ]
+	then
+		opts_interface="$2"
+		shift
+	
+	elif [ "$1" = "-p" ]
+	then
+		opts_ipv6_prefix="$2"
+		shift
+	
+	elif [ "$1" = "-s" ]
+	then
+		opts_ipv6_subnet="$2"
+		shift
+	
+	elif [ "$1" = "-a" ]
+	then
+		opts_ipv6_address="$2"
+		shift
+	
+	elif [ "$1" = "-b" ]
+	then
+		opts_bind_host="$2"
+		shift
+	
+	elif [ "$1" = "-u" ]
+	then
+		opts_unique_identifier="$2"
+		shift
+	
+	elif [ "$1" = "-v" ] || [ "$1" = "-vv" ]
+	then
+		opts_verbosity=$((opts_verbosity + ${#1} - 1))
+	
+	else
+		echo "error: Invalid option ($1)."
+		print_usage
+		exit 1
+	fi
+	
+	shift
+done
+
+if [ "$1" = "connect" ]
+then
+	connect_host="$2"
+	connect_port="${3:-$WIREGUARD_PORT}"
+	
+	conf_file="/etc/wireguard/$opts_interface.conf"
+	privkey_file="/etc/wireguard/$opts_interface.key"
+	
+	# note: private key is stored separately, so that the conf file may be regenerated without affecting the client's keypair
+	if ! [ -e "$privkey_file" ]
+	then
+		echo "info: Generating private key..."
+		(
+			umask 077
+			wg genkey >"$privkey_file"
+		)
+		echo "info: Private key stored in: $privkey_file"
+	fi
+	
+	read -r client_pubkey < <(wg pubkey <"$privkey_file")
+	
+	if [ -z "$opts_unique_identifier" ]
+	then
+		opts_unique_identifier="$client_pubkey"
+	fi
+	
+	echo "info: Connecting to $connect_host:$connect_port..."
+	
+	server_pubkey=""
+	server_port=""
+	server_addr=""
+	
+	client_id="$opts_unique_identifier"
+	client_addr=""
+	
+	read -r -d '' client_info <<EOF
+[Peer] #$client_id
+PublicKey = $client_pubkey
+
+EOF
+	
+	section=""
+	while read -r line || { socat_exit_code="$line" && break; }
+	do
+		[ $opts_verbosity -ge 1 ] && echo "debug: Received line from server: $line"
+		
+		if [ -n "$line" ] && [ "${line:0:1}" = "[" ]
+		then
+			section="${line%%]*}]"
+		fi
+		
+		case "${line// /}" in
+			\#\[server\]:*)
+				echo "server: ${line#*: }" >&2
+			;;
+			\#*)
+				# skip comments
+			;;
+			PublicKey=*)
+				[ "$section" = "[Interface]" ] && read -r server_pubkey <<<"${line#*=}"
+			;;
+			Address=*)
+				[ "$section" = "[Interface]" ] && read -r server_addr <<<"${line#*=}"
+			;;
+			ListenPort=*)
+				[ "$section" = "[Interface]" ] && read -r server_port <<<"${line#*=}"
+			;;
+			AllowedIPs=*)
+				[ "$section" = "[Peer]" ] && read -r client_addr <<<"${line#*=}"
+			;;
+		esac
+	done < <(socat -t20 - tcp:"$connect_host":"$connect_port" <<<"$client_info"; echo -n "$?")
+	
+	if [ "$socat_exit_code" -ne 0 ]
+	then
+		echo "error: Connection failure ($socat_exit_code)."
+		exit 1
+	fi
+	
+	if [ -z "$client_addr" ]
+	then
+		echo "error: Did not receive AllowedIPs from server. Is the client ($client_id) authorized?"
+		echo "note: The server may authorize this client using: echo '$client_id' >>/etc/wireguard/<interface>.auth"
+		exit 1
+	fi
+	
+	echo "info: Configuration received."
+	echo "info: Client address: $client_addr"
+	[ -n "$server_addr" ] && echo "info: Server address: $server_addr"
+	
+	(
+		umask 077
+		cat >"$conf_file" <<EOF
+# Generated by: $0
+
+[Interface]
+PrivateKey = $(cat "$privkey_file")
+Address = $client_addr
+
+[Peer]
+PublicKey = $server_pubkey
+AllowedIPs = ::/0
+Endpoint = $connect_host:$server_port
+PersistentKeepalive = $opts_persistent_keepalive_s
+EOF
+	) || exit $?
+	
+	echo "info: Configuration stored in: $conf_file"
+	
+	if [ -e "/sys/class/net/$opts_interface" ]
+	then
+		# reset interface
+		wg-quick down "$opts_interface"
+		wg-quick up "$opts_interface"
+	else
+		# start interface
+		wg-quick up "$opts_interface"
+	fi
+	
+	wg show "$opts_interface"
+
+elif [ "$1" = "listen" ]
+then
+	listen_port="${2:-$WIREGUARD_PORT}"
+	
+	conf_file="/etc/wireguard/$opts_interface.conf"
+	auth_file="/etc/wireguard/$opts_interface.auth"
+	
+	if ! [ -e "$conf_file" ]
+	then
+		if [ -e "/sys/class/net/$opts_interface" ]
+		then
+			echo "error: Interface already exists ($opts_interface), but configuration file not found ($conf_file)."
+			echo "       Try to run wg-quick down $opts_interface, and try again."
+			exit 1
+		fi
+		
+		echo "info: Generating keypair and configuration file ($conf_file)..."
+		
+		touch "$conf_file"
+		(
+			flock -n -e 200 || { echo "error: Failed to lock file ($conf_file)."; exit 1; }
+			
+			read -r privkey < <(wg genkey)
+			read -r pubkey < <(wg pubkey <<<"$privkey")
+			
+			{
+				umask 077
+				cat <<EOF >"$conf_file"
+# Automatically generated/appended by: $0
+# After editing, seamlessly update using: wg syncconf '$opts_interface' <(wg-quick strip '$opts_interface')
+
+[Interface]
+PrivateKey = $privkey
+#PublicKey = $pubkey
+ListenPort = $listen_port
+Address = $opts_ipv6_prefix$opts_ipv6_subnet$opts_ipv6_address
+
+EOF
+			}
+			
+		) 200< "$conf_file"
+	fi
+	
+	echo "info: > wg-quick up $opts_interface"
+	wg-quick up "$opts_interface"
+	
+	echo "Listening on $opts_bind_host:$listen_port"
+	
+	socat tcp-listen:"$listen_port",bind="$opts_bind_host",reuseaddr,fork system:"$0 -i '$opts_interface' -p '$opts_ipv6_prefix' -s '$opts_ipv6_subnet' -a '$opts_ipv6_address' accept"
+
+elif [ "$1" = "accept" ]
+then
+	conf_file="/etc/wireguard/$opts_interface.conf"
+	auth_file="/etc/wireguard/$opts_interface.auth"
+
+	echo "info: Client[]: Connected." >&2
+	trap 'echo "info: Client[$client_id]: Disconnected." >&2' EXIT
+	
+	client_id=""
+	client_pubkey=""
+	
+	while read -r line
+	do
+		[ $opts_verbosity -ge 1 ] && echo "debug: Client[$client_id]: Received line from client: $line" >&2
+		
+		if [ -z "$client_id" ]
+		then
+			case "$line" in
+				\#*)
+					# skip comments
+				;;
+				\[Peer\]*)
+					# parse client id (using read to trim whitespaces)
+					read -r client_id <<<"${line#*#}"
+				;;
+				*)
+					echo "warn: Client[$client_id]: Bad protocol. Expected [Peer] section, but received: $line" >&2
+					echo "# [server]: Protocol error."
+					exit 2
+				;;
+			esac
+		else
+			case "${line// /}" in
+				\#*)
+					# skip comments
+				;;
+				PublicKey=*)
+					read -r client_pubkey <<<"${line#*=}"
+				;;
+			esac
+		fi
+	
+	done # client must close stdin before server can continue (that is to half-close socket on their end)
+	
+	(
+		flock -w 10 -e 200 || { echo "error: Client[$client_id]: Failed to flock file ($conf_file)." >&2; exit 1; }
+		
+		# note on security: if client_id is interpreted as a regular expression, it would pose a huge security risk, hence we escape it
+		read -r client_id_escaped < <(sed -e 's/[]\/$*.^[]/\\&/g' <<<"$client_id")
+		
+		# send information about this server's wireguard configuration to the client socket (stdout):
+		# but leave the secret PrivateKey out
+		# and uncomment PublicKey (which is commented to make it compatible with wireguard as a non-standard entry)
+		sed -r -n -e '/^\s*\[Interface\]/,/^\s*(\[|$)/p' "$conf_file" | sed -r -n -e '1p; /^\s*PrivateKey\s*=/d; s/^\s*#\s*PublicKey\s*=/PublicKey =/g; /^\s*(\[|$)/!p' && echo
+		
+		# check if client does not exist yet:
+		if ! grep '^\s*\[Peer\]\s*#\s*'"$client_id_escaped"'\s*$' "$conf_file" >/dev/null
+		then
+			touch "$auth_file"
+			(
+				flock -w 10 -e 201 || { echo "error: Client[$client_id]: Failed to flock file ($auth_file)." >&2; exit 1; }
+				
+				# check if this client is in the authorization file:
+				if grep -E '^\s*'"$client_id_escaped"'(\s+|$)' "$auth_file" >/dev/null
+				then
+					echo "info: Client[$client_id]: Client entry found in authorization file." >&2
+					
+					# the auth file should be formatted line by line as follows: <client-id> [client-ipv6-address]
+					read -r client_addr < <(sed -r -n -e '/^\s*'"$client_id_escaped"'(\s+|$)/s/^\S+\s*//p' "$auth_file")
+					
+					# if client_addr starts with ::, then automatically prepend the prefix&subnet
+					if [ "${#client_addr}" -gt 2 ] && [ "${client_addr:0:2}" = "::" ]
+					then
+						client_addr="$opts_ipv6_prefix$opts_ipv6_subnet$client_addr"
+					fi
+					
+					# validate ipv6 address (ip exit code is 1 if parse error)
+					if [ -n "$client_addr" ] && [ "${client_addr: -1}" != ":" ] && ip -6 route get "$client_addr" >/dev/null 2>&1 || [ $? -ne 1 ]
+					then
+						echo "info: Client[$client_id]: Found statically configured IPv6 address ($client_addr)." >&2
+					else
+						# find unused ipv6 address
+						# ::1 is typically reserved for the server's own address, start at 2
+						count=2
+						client_addr="$opts_ipv6_prefix$opts_ipv6_subnet::$count"
+						
+						while [ "$count" -lt 65536 ] && grep -E '(,|\s|=)'"$client_addr"'(,|\s|$)' "$conf_file" "$auth_file" >/dev/null
+						do
+							# add 1 to the last hex group (this method limits the number of clients to a maximum of 65534 clients)
+							client_addr="${client_addr%:*}:$(printf '%x' "$((16#${client_addr##*:} + 1))")"
+							
+							count=$((count + 1))
+						done
+						
+						if [ "$count" -eq 65536 ]
+						then
+							echo "error: Client[$client_id]: Address space exhausted, too many clients ($count)." >&2
+							echo "# [server]: Address space exhausted (too many clients)."
+							exit 4
+						fi
+					fi
+					
+					cat >>"$conf_file" <<EOF
+[Peer] #$client_id
+PublicKey = $client_pubkey
+AllowedIPs = $client_addr
+
+EOF
+					
+					# this would have been executed by wg-quick up "$opts_interface", but we don't want to bring the interface down and up again:
+					ip -6 route add "$client_addr/128" dev "$opts_interface"
+					
+					echo "info: Client[$client_id]: Configuration updated. Route for $client_addr/128 added (remove using: ip -6 route del '$client_addr/128' dev '$opts_interface')." >&2
+					
+					if ! wg syncconf "$opts_interface" <(wg-quick strip "$opts_interface") >&2
+					then
+						echo "error: Client[$client_id]: Failed to sync wg ($opts_interface), but configuration was updated. Check and fix configuration manually ($conf_file), and run: wg syncconf '$opts_interface' <(wg-quick strip '$opts_interface')" >&2
+						exit 5
+					fi
+				else
+					echo "warn: Client[$client_id]: Not authorized (PublicKey = $client_pubkey). Add '$client_id' to $auth_file to authorize." >&2
+					echo "# [server]: Not authorized."
+					exit 3
+				fi
+				
+			) 201< "$auth_file" || exit $?
+		fi
+		
+		# client exists, show all configuration entries of this client:
+		# this is mostly useful for the client so that it may read AllowedIPs and set it as its [Interface]'s Address
+		# note on security: anyone who knows a client's identifier can discover their IP-address, public key, and potentially other properties
+		echo "debug: Client[$client_id]: Sending client info." >&2
+		sed -r -n -e '/^\s*\[Peer\]\s*#\s*'"$client_id_escaped"'\s*$/,/^\s*(\[|$)/p' "$conf_file" | sed -r -n -e '1p; /^\s*(\[|$)/!p' && echo
+	) 200<"$conf_file" || exit $?
+	
+else
+	print_usage
+fi
