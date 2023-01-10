@@ -54,6 +54,7 @@ COMMANDS
   listen [port]
 
       Listen at the given TCP-port.
+      Port defaults to 51820.
 
 
 ```
