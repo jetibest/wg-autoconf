@@ -1,8 +1,8 @@
 # Installation
 
-cd /tmp
-git clone https://github.com/jetibest/wg-autoconf
-cp wg-autoconf/wg-autoconf /usr/local/bin/wg-autoconf
+    cd /tmp
+    git clone https://github.com/jetibest/wg-autoconf
+    cp wg-autoconf/wg-autoconf /usr/local/bin/wg-autoconf
 
 # Example usage
 
