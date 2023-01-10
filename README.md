@@ -1,3 +1,22 @@
+# Installation
+
+cd /tmp
+git clone https://github.com/jetibest/wg-autoconf
+cp wg-autoconf/wg-autoconf /usr/local/bin/wg-autoconf
+
+# Example usage
+
+    server> echo alice >>/etc/wireguard/wg0.auth
+    server> wg-autoconf -i wg0 listen
+    
+    client> wg-autoconf -i wg0 -u alice connect <server>
+
+Note that choosing a simple identifier like 'alice' is an obvious security risk.
+Normally, the public key of the client is chosen as the identifier.
+
+# Help
+
+```
 wg-autoconf: easy tool to setup wireguard in the typical client/server use case
 
 Usage:
@@ -37,3 +56,4 @@ COMMANDS
       Listen at the given TCP-port.
 
 
+```
