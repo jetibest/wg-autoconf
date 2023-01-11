@@ -53,8 +53,52 @@ print_usage()
 	echo "  listen [port]"
 	echo ""
 	echo "      Listen at the given TCP-port."
+	echo "      Port defaults to 51820."
 	echo ""
 	echo ""
+}
+get_peer()
+{
+	__get_peer_id="$1"
+	
+	__get_peer_block=()
+	__get_peer_matched=false
+	__get_peer_section=""
+	while read -r __get_peer_line
+	do
+		if [ -n "$__get_peer_line" ] && [ "${__get_peer_line:0:1}" = "[" ]
+		then
+			$__get_peer_matched && break
+			__get_peer_block=()
+			__get_peer_section="${__get_peer_line%%]*}]"
+		fi
+		
+		if [ "$__get_peer_section" = "[Peer]" ]
+		then
+			__get_peer_block+=("$__get_peer_line")
+			
+			# match peer block by PublicKey, or an identifier in comment behind [Peer] section
+			case "${__get_peer_line// /}" in
+				PublicKey=$__get_peer_id)
+					__get_peer_matched=true
+				;;
+				\[Peer\]\#$__get_peer_id)
+					__get_peer_matched=true
+				;;
+			esac
+		fi
+	done
+	
+	if $__get_peer_matched
+	then
+		for __get_peer_line in "${__get_peer_block[@]}"
+		do
+			echo "$__get_peer_line"
+		done
+		return 0
+	else
+		return 1
+	fi
 }
 
 while [ "${1:0:1}" = "-" ]
@@ -142,8 +186,14 @@ then
 	client_id="$opts_unique_identifier"
 	client_addr=""
 	
+	peer_line="[Peer]"
+	if [ "$client_id" != "$client_pubkey" ]
+	then
+		peer_line="[Peer] #$client_id"
+	fi
+
 	read -r -d '' client_info <<EOF
-[Peer] #$client_id
+$peer_line
 PublicKey = $client_pubkey
 
 EOF
@@ -276,51 +326,62 @@ EOF
 	
 	echo "Listening on $opts_bind_host:$listen_port"
 	
-	socat tcp-listen:"$listen_port",bind="$opts_bind_host",reuseaddr,fork system:"$0 -i '$opts_interface' -p '$opts_ipv6_prefix' -s '$opts_ipv6_subnet' -a '$opts_ipv6_address' accept"
+	cmd=("$0")
+	for ((i=1;i<$opts_verbosity;i++))
+	do
+		cmd+=("-v")
+	done
+	cmd+=("-i" "'$opts_interface'")
+	cmd+=("-p" "'$opts_ipv6_prefix'")
+	cmd+=("-s" "'$opts_ipv6_subnet'")
+	cmd+=("-a" "'$opts_ipv6_address'")
+	cmd+=("accept")
+	
+	socat tcp-listen:"$listen_port",bind="$opts_bind_host",reuseaddr,fork system:"${cmd[*]}"
 
 elif [ "$1" = "accept" ]
 then
 	conf_file="/etc/wireguard/$opts_interface.conf"
 	auth_file="/etc/wireguard/$opts_interface.auth"
-
-	echo "info: Client[]: Connected." >&2
-	trap 'echo "info: Client[$client_id]: Disconnected." >&2' EXIT
+	
+	[ "$opts_verbosity" -ge 1 ] && echo "info: Client[]: Connected." >&2
+	[ "$opts_verbosity" -ge 1 ] && trap 'echo "info: Client[$client_id]: Disconnected." >&2' EXIT
 	
 	client_id=""
 	client_pubkey=""
 	
 	while read -r line
 	do
-		[ $opts_verbosity -ge 1 ] && echo "debug: Client[$client_id]: Received line from client: $line" >&2
+		[ "$opts_verbosity" -ge 2 ] && echo "debug: Client[$client_id]: Received line from client: $line" >&2
 		
-		if [ -z "$client_id" ]
-		then
-			case "$line" in
-				\#*)
-					# skip comments
-				;;
-				\[Peer\]*)
-					# parse client id (using read to trim whitespaces)
-					read -r client_id <<<"${line#*#}"
-				;;
-				*)
-					echo "warn: Client[$client_id]: Bad protocol. Expected [Peer] section, but received: $line" >&2
-					echo "# [server]: Protocol error."
-					exit 2
-				;;
-			esac
-		else
-			case "${line// /}" in
-				\#*)
-					# skip comments
-				;;
-				PublicKey=*)
-					read -r client_pubkey <<<"${line#*=}"
-				;;
-			esac
-		fi
+		case "${line// /}" in
+			\#*)
+				# skip comments
+			;;
+			\[Peer\]\#*)
+				# parse client id (using read to trim whitespaces), only once
+				[ -z "$client_id" ] && read -r client_id <<<"${line#*#}"
+			;;
+			\[Peer\]*)
+				# skip regular peer section
+			;;
+			PublicKey=*)
+				read -r client_pubkey <<<"${line#*=}"
+			;;
+		esac
 	
 	done # client must close stdin before server can continue (that is to half-close socket on their end)
+	
+	if [ -z "$client_pubkey" ]
+	then
+		echo "warn: Client[$client_id]: Bad protocol. PublicKey not given." >&2
+		echo "# [server]: Protocol error."
+		exit 2
+	fi
+	if [ -z "$client_id" ]
+	then
+		client_id="$client_pubkey"
+	fi
 	
 	(
 		flock -w 10 -e 200 || { echo "error: Client[$client_id]: Failed to flock file ($conf_file)." >&2; exit 1; }
@@ -331,10 +392,11 @@ then
 		# send information about this server's wireguard configuration to the client socket (stdout):
 		# but leave the secret PrivateKey out
 		# and uncomment PublicKey (which is commented to make it compatible with wireguard as a non-standard entry)
-		sed -r -n -e '/^\s*\[Interface\]/,/^\s*(\[|$)/p' "$conf_file" | sed -r -n -e '1p; /^\s*PrivateKey\s*=/d; s/^\s*#\s*PublicKey\s*=/PublicKey =/g; /^\s*(\[|$)/!p' && echo
+		# also leave any comments out (both on a separate line, or at the end of a line
+		sed -r -n -e '/^\s*\[Interface\]/,/^\s*\[/p' "$conf_file" | sed -r -n -e '1p; /^\s*PrivateKey\s*=/d; s/^\s*#\s*PublicKey\s*=/PublicKey =/g; s/#.*$//g; /^\s*(#|\[)/!p'
 		
-		# check if client does not exist yet:
-		if ! grep '^\s*\[Peer\]\s*#\s*'"$client_id_escaped"'\s*$' "$conf_file" >/dev/null
+		# check if peer does not exist yet
+		if ! get_peer "$client_id" <"$conf_file" >/dev/null
 		then
 			touch "$auth_file"
 			(
@@ -379,9 +441,15 @@ then
 							exit 4
 						fi
 					fi
+
+					peer_line="[Peer]"
+					if [ "$client_id" != "$client_pubkey" ]
+					then
+						peer_line="[Peer] #$client_id"
+					fi
 					
 					cat >>"$conf_file" <<EOF
-[Peer] #$client_id
+$peer_line
 PublicKey = $client_pubkey
 AllowedIPs = $client_addr
 
@@ -409,8 +477,11 @@ EOF
 		# client exists, show all configuration entries of this client:
 		# this is mostly useful for the client so that it may read AllowedIPs and set it as its [Interface]'s Address
 		# note on security: anyone who knows a client's identifier can discover their IP-address, public key, and potentially other properties
-		echo "debug: Client[$client_id]: Sending client info." >&2
-		sed -r -n -e '/^\s*\[Peer\]\s*#\s*'"$client_id_escaped"'\s*$/,/^\s*(\[|$)/p' "$conf_file" | sed -r -n -e '1p; /^\s*(\[|$)/!p' && echo
+
+		[ "$opts_verbosity" -ge 1 ] && echo "info: Client[$client_id]: Sending Peer-block to client." >&2
+
+		get_peer "$client_id" <"$conf_file"
+		
 	) 200<"$conf_file" || exit $?
 	
 else
