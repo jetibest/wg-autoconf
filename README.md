@@ -1,3 +1,7 @@
+# Introduction
+
+This tool will automatically setup IPv6 addresses for you (like DHCP). The only thing you have to do, is to add the client's PublicKey to an authorization file on the server. When trying to connect for the first time, both the client and server will detect the unauthorized attempt, and tell you exactly how to authorize the given client on the server.
+
 # Installation
 
     cd /tmp
@@ -12,7 +16,7 @@
     client> wg-autoconf -i wg0 -u alice connect <server>
 
 Note that choosing a simple identifier like 'alice' is an obvious security risk.
-Normally, the public key of the client is chosen as the identifier.
+By default, the public key is chosen as the identifier automatically.
 
 # Help
 
