@@ -387,7 +387,7 @@ then
 		flock -w 10 -e 200 || { echo "error: Client[$client_id]: Failed to flock file ($conf_file)." >&2; exit 1; }
 		
 		# note on security: if client_id is interpreted as a regular expression, it would pose a huge security risk, hence we escape it
-		read -r client_id_escaped < <(sed -e 's/[]\/$*.^[]/\\&/g' <<<"$client_id")
+		read -r client_id_escaped < <(sed -E -e 's/[]+*?/{}()$^\\\[]/\\&/g' <<<"$client_id")
 		
 		# send information about this server's wireguard configuration to the client socket (stdout):
 		# but leave the secret PrivateKey out
