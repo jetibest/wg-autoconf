@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 
-# note: Origin of default prefix: wireguard = WireGuard = ['w', 'g'] = [119, 103] = [0x77, 0x67] = 7767::
+# note: Origin of default prefix: Wireguard = 'w' = [119] = [0x77] = fd77:: (fd/8 is required as a private/local IPv6-range prefix)
 # note: The server exposes a TCP-socket at the same port as as wireguard (which is listening to UDP), due to the different protocol, these ports are not in conflict
 # note: The wg-autoconf non-standard configuration is stored in /etc/wireguard/<interface>.autoconf, the derived configuration for Wireguard is in /etc/wireguard/<interface>.conf
+# note: It is highly recommended to change the Wireguard port from 51820 to a non-ephemeral port, since another process may already use this port, which results in a higher chance of conflict. For example, use port 5182 instead, or 7767 (which is hexadecimal for 'wg').
 
-# TODO: add INPUT/OUTPUT chain for UDP/TCP ports, so that it can be cleaned up in a simple way, even if the ListenPort has changed meanwhile
-# TODO: the "AllowedIP has nonzero host part" warning can be prevented by filtering the config accordingly (in: wg-autoconf conf strip)
-# TODO: add support for MASQUERADE
-# TODO: update usage manual, and shorten double-ish code (put in functions)
+# TODO: add support for MASQUERADE, make it working for IPv6 traffic first, set MasqueradeDevice as an entry of the Interface to remember the link device through which clients can connect (use a manual setup first, possibly with wg-quick)
+# TODO: also apply rules for iptables (to support IPv4 traffic for masquerading)
 # TODO: make wg-monitor that checks tunnel periodically (not as a keepalive), and automatically runs connect again (which also updates DNS to fetch new IP-address for Endpoints)
+
+# note: Wireguard is dual-stack by default.
 
 # default port as per Wireguard docs
 WIREGUARD_PORT="51820"
@@ -25,290 +26,15 @@ DEFAULT_INTERFACE="wg0"
 DEFAULT_MTU="1400"
 
 # Sensible default values:
-DEFAULT_VPN_PREFIX="7767"
+DEFAULT_VPN_PREFIX="fd77"
 DEFAULT_VPN_ADDRESS="$DEFAULT_VPN_PREFIX:1::1/32"
 
+DEFAULT_PREFIX_MASK="16"
 DEFAULT_SUBNET_MASK="48"
 DEFAULT_BIND_HOST="::"
 DEFAULT_PERSISTENT_KEEPALIVE_S="25"
 
-opts_interface="$DEFAULT_INTERFACE"
-opts_vpn_address=""
-opts_bind_host="$DEFAULT_BIND_HOST"
-opts_persistent_keepalive_s="$DEFAULT_PERSISTENT_KEEPALIVE_S"
-opts_verbosity="0"
-opts_mac_address=""
-opts_subnet_mask="$DEFAULT_SUBNET_MASK"
 
-print_usage()
-{
-	context="$1"
-	case "$context" in
-		server|client|conf|wg) ;;
-		*) context=""
-	esac
-	
-	echo "wg-autoconf: Automated Wireguard configuration cli-tool."
-	echo ""
-	echo "DEPENDENCIES"
-	echo " -> wg"
-	echo " -> socat"
-	echo " -> ip6tables"
-	echo " -> flock, ip, grep, sed, cat (busybox)"
-	echo " -> any modern Linux shell (bash)"
-	echo ""
-	echo ""
-	echo "USAGE"
-	echo "  $0 [OPTIONS] ${context:-<server|client|conf|wg>} <COMMAND>"
-	echo ""
-	echo ""
-	echo "OPTIONS"
-	echo "  -i <interface>       Set name of the wireguard-interface."
-	echo "                       Defaults to: $DEFAULT_INTERFACE"
-	echo "  -v                   Increase verbosity."
-	echo "  -h, --help <context> Show this help. Context can be any of server, client,"
-	echo "                       or conf."
-	echo "                       Defaults to: Show help for all contexts."
-	echo ""
-	echo ""
-	if [ -z "$context" ] || [ "$context" = "wg" ]
-	then
-		echo "WG COMMANDS"
-		echo ""
-		echo "  update"
-		echo ""
-		echo "      Synchronize configuration file with the Wireguard interface, and ensure"
-		echo "      all ip6tables rules and ip routes are setup correctly. Does not bring"
-		echo "      the Wireguard interface up if it is down."
-		echo ""
-		echo "  up"
-		echo ""
-		echo "      Same as update, but also ensures the Wireguard interface is brought up."
-		echo ""
-		echo "  down"
-		echo ""
-		echo "      Bring the Wireguard interface down. All ip6tables and ip routes rules"
-		echo "      are also cleaned up."
-		echo ""
-		echo ""
-	fi
-	if [ -z "$context" ] || [ "$context" = "server" ]
-	then
-		echo "SERVER COMMANDS"
-		echo ""
-		echo "  connect <host> [port]"
-		echo ""
-		echo "      Connect to the given server running wg-autoconf listen."
-		echo "      To be run by a server. Will register itself (as a server) at the remote"
-		echo "      server. If the local public key is authorized by the remote server, the"
-		echo "      remote server will append a Peer-section with this local server as its"
-		echo "      endpoint."
-		echo "      Port defaults to 51820."
-		echo ""
-		echo "  listen [port]"
-		echo ""
-		echo "      Listen at the given TCP-port."
-		echo "      Any remote clients and servers can connect, and if authorized, be added"
-		echo "      to the subnet that this server provides."
-		echo "      Port defaults to 51820."
-		echo ""
-		echo "  allow <public-key> [Type=<server|client>]"
-		echo ""
-		echo "      Allow Peer identified by the given Public Key to connect."
-		echo "      Ensures a Peer-section in the configuration file."
-		echo "      If Type is set to server, the Peer will be able to register its own"
-		echo "      Endpoint and AllowedIPs entries upon connect."
-		echo ""
-		echo "  deny <public-key>"
-		echo ""
-		echo "      Deny Peer identified by the given Public Key from connecting."
-		echo "      Removes a Peer-section from the configuration file."
-		echo ""
-		echo ""
-		echo "SERVER CONNECT OPTIONS"
-		echo ""
-		echo "  -k <seconds>      Set persistent keepalive seconds."
-		echo "                    Defaults to: $DEFAULT_PERSISTENT_KEEPALIVE_S"
-		echo ""
-		echo ""
-		echo "SERVER LISTEN OPTIONS"
-		echo ""
-		echo "  -a <ipv6-address> Set address of the server in the virtual IPv6 network"
-		echo "                    Defaults to: $DEFAULT_VPN_ADDRESS"
-		echo "  -b <bind-host>    Set host to bind to."
-		echo "                    Defaults to: $DEFAULT_BIND_HOST"
-		echo "                    Use 0.0.0.0 to bind to every IPv4 interface."
-		echo "                    Use :: to bind to every IPv6 interface."
-		echo "                    In order to listen at both IPv4 and IPv6 interfaces, two"
-		echo "                    separate instances must be run."
-		echo "  -s <mask>         Specify a bitmask for the subnet division. Any client that"
-		echo "                    is connected to the virtual network can access any other"
-		echo "                    client, but only if it is in the same subnet."
-		echo "                    Defaults to: $DEFAULT_SUBNET_MASK"
-		echo ""
-		echo ""
-	fi
-	if [ -z "$context" ] || [ "$context" = "client" ]
-	then
-		echo "CLIENT COMMANDS"
-		echo ""
-		echo "  connect <host> [port]"
-		echo ""
-		echo "      Connect to the given server running wg-autoconf listen."
-		echo "      To be run by a client, any existing configuration for this interface"
-		echo "      will be completely overwritten. Do NOT run as server, since all"
-		echo "      existing clients will be disconnected, and manual configuration changes"
-		echo "      will be deleted."
-		echo "      Port defaults to 51820."
-		echo ""
-		echo ""
-		echo "CLIENT CONNECT OPTIONS"
-		echo ""
-		echo "  -m [MAC-address]  Set the Interface ID part of the IPv6 address. If the"
-		echo "                    MAC-address is not defined, then it will default to the"
-		echo "                    first available network device, which is then cached for"
-		echo "                    subsequent connects in: /etc/wireguard/<interface>.id"
-		echo "                    The server is not guaranteed to incorporate the"
-		echo "                    Interface ID into the client's allowed IP address (i.e."
-		echo "                    in case the ID is not unique)."
-		echo "  -k <seconds>      Set persistent keepalive seconds."
-		echo "                    Defaults to: $DEFAULT_PERSISTENT_KEEPALIVE_S"
-		echo ""
-		echo ""
-	fi
-	if [ -z "$context" ] || [ "$context" = "conf" ]
-	then
-		echo "CONF COMMANDS"
-		echo ""
-		echo "  show"
-		echo ""
-		echo "      Print the contents of the configuration file."
-		echo ""
-		echo "  get-interface [entry]"
-		echo ""
-		echo "      Print the Interface-section of the configuration file."
-		echo "      If an entry is specified, only the value of that entry is printed."
-		echo "      If an entry has multiple values separated by a comma, these values"
-		echo "      are printed on separate lines."
-		echo ""
-		echo "  get-peer <public-key> [entry]"
-		echo ""
-		echo "      Print the Peer-section of the configuration file, that contains a"
-		echo "      PublicKey entry with the given public-key value."
-		echo "      If an entry is specified, only the value of that entry is printed."
-		echo "      If an entry has multiple values separated by a comma, these values"
-		echo "      are printed on separate lines."
-		echo ""
-		echo "  strip"
-		echo ""
-		echo "  list-peers"
-		echo ""
-		echo "  set-peer"
-		echo ""
-		echo ""
-	fi
-	if [ -z "$context" ]
-	then
-		echo "AUTOCONF CONFIGURATION FILE"
-		echo ""
-		echo "wg-autoconf uses non-standard properties, which are by prefixed by a single"
-		echo "comment character (#). These actually have effect, and are not considered"
-		echo "comments for wg-autoconf, but are comments with regard to Wireguard. This"
-		echo "allows for complete compatibility with Wireguard."
-		echo ""
-		echo ""
-		echo "AUTOCONF PROTOCOL"
-		echo ""
-		echo "wg-autoconf listens on the same port as WireGuard. Since wg-autoconf uses"
-		echo "TCP, and WireGuard uses UDP, there is no conflict."
-		echo ""
-		echo "Within the virtual network, only IPv6-addresses are supported due to its"
-		echo "additional flexibility. For the real non-virtual network, both IPv4 and IPv6"
-		echo "are supported."
-		echo ""
-		echo ""
-		echo "IPV6 FORWARDING AND IP6TABLES"
-		echo ""
-		echo "Note that when using listen, IPv6 forwarding is enabled (and accept_ra is set"
-		echo "to 2). This is why, for security, the default policy of the FORWARD chain will"
-		echo "be set to DROP. That is, no IPv6 forwarding is allowed unless explicitly"
-		echo "accepted by a rule in the FORWARD chain of ip6tables."
-		echo ""
-		echo "Any ip6tables rules that are added by wg-autoconf, will be in a separate chain"
-		echo "and will be automatically cleaned up when running the down command."
-		echo ""
-		echo ""
-		echo "RECOMMENDED IPV6 ALLOCATION"
-		echo ""
-		echo "  <prefix> : <server> : <subnet> : <unused> : <interface-identifier>"
-		echo ""
-		echo "Where:"
-		echo " -> prefix is a unique identifier for this virtual private network."
-		echo " -> server is a unique identifier for each individual server (i.e. site)."
-		echo " -> subnet isolates clients from each other that are in different subnets."
-		echo " -> unused is a further custom distinction of client groups, may be left zero."
-		echo " -> interface-identifier is a 64-bit identifier reserved to uniquely identify"
-		echo "    clients across multiple subnets and groups. By default this is the"
-		echo "    MAC-address of the client."
-		echo ""
-		echo ""
-		echo "TROUBLESHOOTING"
-		echo ""
-		echo " 1. Check if interface is up and has the intended virtual IPv6-address"
-		echo " 2. Check if IPv6-forwarding is enabled, using:"
-		echo ""
-		echo "      cat /proc/sys/net/ipv6/conf/<wg0|all>/forwarding"
-		echo ""
-		echo " 3. Check if the virtual IPv6-address is routed correctly, using:"
-		echo ""
-		echo "      ip -6 route [dev wg0]"
-		echo ""
-		echo " 4. Check if the route is blocked by netfilter with ip6tables:"
-		echo ""
-		echo "      ip6tables -L"
-		echo ""
-		echo " 5. Check from the client's perspective if the Endpoint IP-address in"
-		echo "    the [Peer] section that belongs to the server is correct."
-		echo " 6. Check if the port in the Endpoint from step 5 is correct."
-		echo " 7. Check if the port from step 6 matches the ListenPort on the server:"
-		echo "    wg show <wg0> listen-port"
-		echo " 8. Check if the PublicKey entry of the [Peer] section matches the"
-		echo "    PublicKey generated from the PrivateKey of the [Interface] section"
-		echo "    of the other peer. Check both ends. If one end is misconfigured,"
-		echo "    then the whole connection fails."
-		echo ""
-		echo "Wireguard uses the UDP-protocol, the wg-autoconf utility uses TCP-protocol."
-		echo "Debug UDP traffic using:"
-		echo ""
-		echo "    tcpdump -n udp"
-		echo ""
-		echo "If ping to a virtual address fails with:"
-		echo ""
-		echo "    Destination unreachable: Address unreachable"
-		echo ""
-		echo "then the traffic is correctly locally routed through the Wireguard link"
-		echo "device, but Wireguard responds that the virtual target IPv6-address is"
-		echo "unreachable. Check the AllowedIPs of the relevant [Peer] section."
-		echo ""
-		echo "Wireguard will give a warning:"
-		echo ""
-		echo "    warning: AllowedIP has nonzero host part"
-		echo ""
-		echo "which can be safely ignored. It indicates a subnet mask catches more than"
-		echo "one specific IPv6-address, and thus for clarity it should end with zeroes"
-		echo "(::). But wg-autoconf specifies the address anyway, to store the IP-address"
-		echo "of the server itself."
-		echo ""
-		echo "If a server is added to the mesh, all previously connected peers (clients"
-		echo "and servers) must reconnect using wg-autoconf. So that the new IP-addresses"
-		echo "are propagated. If the mesh is dynamic, it is highly recommended to use"
-		echo "wg-monitor which automatically propagates updates through the mesh network"
-		echo "and furthermore keeps connections alive (to achieve redundancy)."
-		echo ""
-		echo ""
-		
-	fi
-}
 expand_ipv6()
 {
 	__expand_ipv6_ip="${1%%/*}"
@@ -341,6 +67,14 @@ compress_ipv6()
 {
 	__compress_ipv6_ip="$1"
 	
+	__compress_ipv6_mask=""
+	case "$__compress_ipv6_ip" in
+		*/*)
+			__compress_ipv6_mask="/${__compress_ipv6_ip#*/}"
+			__compress_ipv6_ip="${__compress_ipv6_ip%/*}"
+		;;
+	esac
+	
 	__compress_ipv6_ip="$(echo "$__compress_ipv6_ip" | sed -e 's/::/:0:/g' | grep -o "[0-9a-f]\+" | while read -r __compress_ipv6_hex; do [ -n "$__compress_ipv6_hex" ] && printf ":%x" "$((0x$__compress_ipv6_hex))"; done)"
 	
 	for __compress_ipv6_chain in :0:0:0:0:0:0:0:0 :0:0:0:0:0:0:0 :0:0:0:0:0:0 :0:0:0:0:0 :0:0:0:0 :0:0:0 :0:0 :0
@@ -351,13 +85,54 @@ compress_ipv6()
 				break
 		esac
 	done
-
+	
 	case "$__compress_ipv6_ip" in
 		::*) ;;
 		:*) __compress_ipv6_ip="${__compress_ipv6_ip#:}"
 	esac
-
-	echo "$__compress_ipv6_ip"
+	
+	echo "$__compress_ipv6_ip$__compress_ipv6_mask"
+}
+hex_to_expanded_ipv6()
+{
+	# the result might be 123456, but then it should turn into: 1234:5600
+	# so always make sure, that the amount of input digits is rounded to 4, and append 0's
+	
+	__hex_to_expanded_ipv6_addr="$1"
+	while [ "$((${#__hex_to_expanded_ipv6_addr} % 4))" -ne 0 ]
+	do
+		__hex_to_expanded_ipv6_addr="${__hex_to_expanded_ipv6_addr}0"
+	done
+	
+	expand_ipv6 "$(sed -e 's/.\{4\}/&:/g;s/:$//' <<<"${__hex_to_expanded_ipv6_addr:0:32}")"
+}
+apply_ipv6_mask()
+{
+	# note: input may not contain a ($) cost metric
+	__apply_ipv6_mask_input="$1"
+	
+	case "$__apply_ipv6_mask_input" in
+		*/128) ;; # 128 is most specific, so no removal of digits required
+		*/*)
+			# extract mask
+			__apply_ipv6_mask_mask="${__apply_ipv6_mask_input#*/}"
+			# extract address
+			__apply_ipv6_mask_addr="${__apply_ipv6_mask_input%/*}"
+			# expand address
+			read -r __apply_ipv6_mask_addr < <(expand_ipv6 "$__apply_ipv6_mask_addr")
+			# remove colons
+			__apply_ipv6_mask_addr="${__apply_ipv6_mask_addr//:/}"
+			# remove trailing digits given the mask
+			__apply_ipv6_mask_addr="${__apply_ipv6_mask_addr:0:$((__apply_ipv6_mask_mask / 4))}"
+			# put colons back in
+			read -r __apply_ipv6_mask_addr < <(hex_to_expanded_ipv6 "$__apply_ipv6_mask_addr")
+			# reconstruct the address with mask
+			__apply_ipv6_mask_input="$__apply_ipv6_mask_addr/$__apply_ipv6_mask_mask"
+		;;
+		*) ;; # no mask, is same as /128
+	esac
+	
+	compress_ipv6 "$__apply_ipv6_mask_input"
 }
 is_ipv6()
 {
@@ -445,6 +220,7 @@ strtoupper()
 {
 	tr '[:lower:]' '[:upper:]' <<<"$1"
 }
+# usage note: join works with multiple characters
 join()
 {
 	__join_delim="$1"
@@ -479,226 +255,402 @@ split()
 		
 		if [ -n "$__split_var" ]
 		then
-			# assign entry to array (if given)
-			eval "$__split_var+=('$__split_entry')"
+			# assign entry to array (if given), first use printf %q to escape special characters
+			read -r __split_entry < <(printf '%q' "$__split_entry")
+			eval "$__split_var+=($__split_entry)"
 		else
 			# print every entry on a new line
 			echo "$__split_entry"
 		fi
 		
-	done <<<"$input$delim"
+	done <<<"$__split_input$__split_delim"
 }
 sock_send()
 {
 	printf "%s\n" ">> $*" >&2
 	printf "%s\n" "$*"
 }
+sock_send_lines()
+{
+	for __sock_send_lines_ln in "$@"
+	do
+		sock_send "$__sock_send_lines_ln"
+	done
+}
 sock_receive()
 {
 	printf "%s\n" "<< $*" >&2
 }
+is_http()
+{
+	__is_http_host="$1"
+	__is_http_port="$2"
+	
+	# ports 80 and 443 are reserved for HTTP/HTTPS
+	case "$__is_http_port" in
+		80|443)
+			return 0
+		;;
+	esac
+	
+	# do a HEAD request to check if we're dealing with a webserver
+	read __is_http_res _ < <(sed -r -e 's/([^\r]|^)$/\1\r/' <<EOF | socat -t20 - tcp:"$__is_http_host":"$__is_http_port"
+HEAD / HTTP/1.1
+Host: $__is_http_host
+User-Agent: wg-autoconf/1.0
+Accept: */*
+
+EOF
+	)
+	
+	case "$__is_http_res" in
+		HTTP/*)
+			return 0
+		;;
+	esac
+	
+	return 1
+}
 
 
-opts_context=""
-opts_command=""
-
-while true
-do
-	if [ "$1" = "--" ]
-	then
-		shift
-		break
-
-	elif [ "$1" = "server" ]
-	then
-		opts_context="server"
+print_usage()
+{
+	context="$1"
+	case "$context" in
+		server|client|conf|wg) ;;
+		*) context=""
+	esac
 	
-	elif [ "$1" = "client" ]
+	echo "wg-autoconf: Automated Wireguard configuration cli-tool."
+	echo ""
+	echo "DEPENDENCIES"
+	echo " -> wg"
+	echo " -> socat"
+	echo " -> ip6tables"
+	echo " -> flock, ip, grep, sed, cat (busybox)"
+	echo " -> any modern Linux shell (bash)"
+	echo ""
+	echo ""
+	echo "USAGE"
+	echo "  $0 [OPTIONS] ${context:-[CONTEXT]} <COMMAND>"
+	echo ""
+	echo "OPTIONS"
+	echo "  -i <interface>       Set name of the wireguard-interface."
+	echo "                       Defaults to: $DEFAULT_INTERFACE"
+	echo "  -v                   Increase verbosity."
+	echo "  -h, --help <context> Show this help. Context can be any of server, client,"
+	echo "                       or conf."
+	echo "                       Defaults to: Show help for all contexts."
+	echo ""
+	echo "COMMANDS"
+	echo ""
+	echo "  find"
+	echo ""
+	echo "      Find a client by its Interface ID (the trailing end of the virtual"
+	echo "      IPv6-address."
+	echo ""
+	echo "  update"
+	echo ""
+	echo "      Synchronize configuration file with the Wireguard interface, and ensure"
+	echo "      all ip6tables rules and ip routes are setup correctly. Does not bring"
+	echo "      the Wireguard interface up if it is down."
+	echo ""
+	echo "  up"
+	echo ""
+	echo "      Same as update, but also ensures the Wireguard interface is brought up."
+	echo ""
+	echo "  down"
+	echo ""
+	echo "      Bring the Wireguard interface down. All ip6tables and ip routes rules"
+	echo "      are also cleaned up."
+	echo ""
+	echo ""
+	if [ -z "$context" ] || [ "$context" = "conf" ]
 	then
-		opts_context="client"
-	
-	elif [ "$1" = "connect" ]
-	then
-		if [ -z "$opts_context" ]
-		then
-			# automatically deciding on client or server as context is dangerous here
-			echo "error: Invalid usage. Specify a context before the $1-command."
-			echo "Usage: $0 <client|server> connect <host> [port]"
-			exit 1
-		fi
-		opts_command="connect"
-	
-	elif [ "$1" = "listen" ]
-	then
-		if [ -z "$opts_context" ]
-		then
-			echo "error: Invalid usage. Specify a context before the $1-command."
-			echo "Usage: $0 server listen [port]"
-			exit 1
-		fi
-		opts_command="listen"
-	
-	elif [ "$1" = "-i" ]
-	then
-		opts_interface="$2"
-		shift
-	
-	elif [ "$1" = "-a" ]
-	then
-		# if starts with colon, prefix with default 7767 prefix
-		opts_vpn_address="$2"
-		case "$opts_vpn_address" in
-			:*) opts_vpn_address="$DEFAULT_VPN_PREFIX$opts_vpn_address"
-		esac
-		
-		# if does not have a mask, assume based on colon count given where trailing ::* is removed
-		case "$opts_vpn_address" in
-			*/*) ;;
-			*)
-				# if partial prefix address, then add :: at the end
-				if ! is_ipv6 "$opts_vpn_address"
-				then
-					opts_vpn_address="${opts_vpn_address%%:}"
-					opts_vpn_address="$opts_vpn_address::"
-				fi
-				
-				# count hex digits to automatically determine the subnet mask, using :: as a separator between the server's Interface ID and the subnet mask
-				read -r hexdigits < <(expand_ipv6 "${opts_vpn_address%%::*}")
-				read -r hexdigits < <(sed -r -e 's/://g' -e 's/0+$//g' <<<"$hexdigits")
-				opts_vpn_address="$opts_vpn_address/$((4 * ${#hexdigits}))"
-			;;
-		esac
-		
-		# if ends with : or ::, then set to end with ::1 (::0 is considered invalid, bad practice to use this, reserved for special meaning)
-		case "$opts_vpn_address" in
-			*:/*) opts_vpn_address="${opts_vpn_address/:\//:1\/}"
-		esac
-		
-		# check if argument is a valid IPv6-address
-		if ! is_ipv6 "$opts_vpn_address"
-		then
-			echo "error: Invalid usage. The address argument (-a) expects a valid IPv6-address (deduced $opts_vpn_address from $2)."
-			exit 1
-		fi
-		
-		[ "$opts_verbosity" -lt 1 ] || echo "debug: Parsed address argument: $opts_vpn_address"
-		
-		shift
-	
-	elif [ "$1" = "-k" ]
-	then
-		opts_persistent_keepalive_s="$2"
-		shift
-	
-	elif [ "$1" = "-b" ]
-	then
-		opts_bind_host="$2"
-		shift
-	
-	elif [ "$1" = "-m" ]
-	then
-		opts_mac_address="$2"
-		case "$2" in
-			*[^0-9a-f:-]*|"")
-				# if empty, or contains illegal MAC-address character, set to auto (also allow dashes for hexadecimal uuid's)
-				opts_mac_address="auto"
-			;;
-			*)
-				# consume argument
-				shift
-			;;
-		esac
-	
-	elif [ "$1" = "-s" ]
-	then
-		opts_subnet_mask="${2#*/}"
-		shift
-	
-	elif [ "$1" = "-v" ] || [ "$1" = "-vv" ]
-	then
-		opts_verbosity=$((opts_verbosity + ${#1} - 1))
-	
-	elif [ "$1" = "-h" ] || [ "$1" = "--help" ]
-	then
-		print_usage "$2"
-		exit 0
-	
-	elif [ "${1:0:1}" = "-" ]
-	then
-		echo "error: Invalid option ($1)."
-		print_usage
-		exit 1
-	else
-		if [ -z "$opts_context" ]
-		then
-			opts_context="$1"
-			shift
-		fi
-		if [ -z "$opts_command" ]
-		then
-			opts_command="$1"
-			shift
-		fi
-		break # end of options
+		echo "CONF COMMANDS"
+		echo ""
+		echo "  conf show"
+		echo ""
+		echo "      Print the contents of the configuration file."
+		echo ""
+		echo "  conf get-interface [entry]"
+		echo ""
+		echo "      Print the Interface-section of the configuration file."
+		echo "      If an entry is specified, only the value of that entry is printed."
+		echo "      If an entry has multiple values separated by a comma, these values"
+		echo "      are printed on separate lines."
+		echo ""
+		echo "  conf get-peer <public-key> [entry]"
+		echo ""
+		echo "      Print the Peer-section of the configuration file, that contains a"
+		echo "      PublicKey entry with the given public-key value."
+		echo "      If an entry is specified, only the value of that entry is printed."
+		echo "      If an entry has multiple values separated by a comma, these values"
+		echo "      are printed on separate lines."
+		echo ""
+		echo "  conf strip"
+		echo ""
+		echo "  conf list-peers"
+		echo ""
+		echo "  conf set-peer"
+		echo ""
+		echo ""
 	fi
-	
-	if ! shift
+	if [ -z "$context" ] || [ "$context" = "server" ]
 	then
-		break # no more arguments
+		echo "SERVER COMMANDS"
+		echo ""
+		echo "  server connect <host> [port]"
+		echo ""
+		echo "      Connect to the given server running wg-autoconf listen."
+		echo "      To be run by a server. Will register itself (as a server) at the remote"
+		echo "      server. If the local public key is authorized by the remote server, the"
+		echo "      remote server will append a Peer-section with this local server as its"
+		echo "      endpoint."
+		echo "      Port defaults to 51820."
+		echo ""
+		echo "  server listen [port]"
+		echo ""
+		echo "      Listen at the given TCP-port."
+		echo "      Any remote clients and servers can connect, and if authorized, be added"
+		echo "      to the subnet that this server provides."
+		echo "      Port defaults to 51820."
+		echo ""
+		echo "  server allow <public-key> [Type=<server|client>]"
+		echo ""
+		echo "      Allow Peer identified by the given Public Key to connect."
+		echo "      Ensures a Peer-section in the configuration file."
+		echo "      If Type is set to server, the Peer will be able to register its own"
+		echo "      Endpoint and AllowedIPs entries upon connect."
+		echo ""
+		echo "  server deny <public-key>"
+		echo ""
+		echo "      Deny Peer identified by the given Public Key from connecting."
+		echo "      Removes a Peer-section from the configuration file."
+		echo ""
+		echo ""
+		echo "SERVER CONNECT OPTIONS"
+		echo ""
+		echo "  -k <seconds>      Set persistent keepalive seconds."
+		echo "                    Defaults to: $DEFAULT_PERSISTENT_KEEPALIVE_S"
+		echo ""
+		echo ""
+		echo "SERVER LISTEN OPTIONS"
+		echo ""
+		echo "  -a <ipv6-address> Set address of the server in the virtual IPv6 network"
+		echo "                    Defaults to: $DEFAULT_VPN_ADDRESS"
+		echo "  -b <bind-host>    Set host to bind to."
+		echo "                    Defaults to: $DEFAULT_BIND_HOST"
+		echo "                    Use 0.0.0.0 to bind to every IPv4 interface."
+		echo "                    Use :: to bind to every IPv6 interface."
+		echo "                    In order to listen at both IPv4 and IPv6 interfaces, two"
+		echo "                    separate instances must be run."
+		echo "  -p <mask>         Specify a bitmask for the prefix division. The client will"
+		echo "                    use this to setup routing. This ensures that if a new"
+		echo "                    server is added to the mesh, the client can immediately"
+		echo "                    route traffic to the new server as well."
+		echo "                    Defaults to: $DEFAULT_PREFIX_MASK"
+		echo "  -s <mask>         Specify a bitmask for the subnet division. Any client that"
+		echo "                    is connected to the virtual network can access any other"
+		echo "                    client, but only if it is in the same subnet."
+		echo "                    To disable this functionality, set the mask to 0, or any"
+		echo "                    value less than the server Address mask."
+		echo "                    Defaults to: $DEFAULT_SUBNET_MASK"
+		echo ""
+		echo ""
 	fi
-done
+	if [ -z "$context" ] || [ "$context" = "client" ]
+	then
+		echo "CLIENT COMMANDS"
+		echo ""
+		echo "  client connect <host> [port]"
+		echo ""
+		echo "      Connect to the given server running wg-autoconf listen."
+		echo "      To be run by a client, any existing configuration for this interface"
+		echo "      will be completely overwritten. Do NOT run as server, since all"
+		echo "      existing clients will be disconnected, and manual configuration changes"
+		echo "      will be deleted."
+		echo "      Port defaults to 51820."
+		echo ""
+		echo ""
+		echo "CLIENT CONNECT OPTIONS"
+		echo ""
+		echo "  -m [MAC-address]  Set the Interface ID part of the IPv6 address. If the"
+		echo "                    MAC-address is not defined, then it will default to the"
+		echo "                    first available network device, which is then cached for"
+		echo "                    subsequent connects in: /etc/wireguard/<interface>.id"
+		echo "                    The server is not guaranteed to incorporate the"
+		echo "                    Interface ID into the client's allowed IP address (i.e."
+		echo "                    in case the ID is not unique)."
+		echo "  -k <seconds>      Set persistent keepalive seconds."
+		echo "                    Defaults to: $DEFAULT_PERSISTENT_KEEPALIVE_S"
+		echo ""
+		echo ""
+	fi
+	if [ -z "$context" ]
+	then
+		echo "AUTOCONF CONFIGURATION FILE"
+		echo ""
+		echo "wg-autoconf uses extended properties in the configuration file. In order to"
+		echo "generate a configuration that Wireguard can work with, use:"
+		echo ""
+		echo "    wg syncconf <interface> <(wg-autoconf conf strip <interface>)"
+		echo ""
+		echo ""
+		echo "AUTOCONF PROTOCOL"
+		echo ""
+		echo "wg-autoconf listens on the same port as WireGuard. Since wg-autoconf uses"
+		echo "TCP, and WireGuard uses UDP, there is no conflict."
+		echo ""
+		echo "Within the virtual network, only IPv6-addresses are supported due to its"
+		echo "additional flexibility. For the real non-virtual network, both IPv4 and IPv6"
+		echo "are supported."
+		echo ""
+		echo ""
+		echo "IPV6 FORWARDING AND IP6TABLES"
+		echo ""
+		echo "Note that when using listen, IPv6 forwarding is enabled (and accept_ra is set"
+		echo "to 2). This is why, for security, the default policy of the FORWARD chain will"
+		echo "be set to DROP. That is, no IPv6 forwarding is allowed unless explicitly"
+		echo "accepted by a rule in the FORWARD chain of ip6tables."
+		echo ""
+		echo "Any ip6tables rules that are added by wg-autoconf, will be in a separate chain"
+		echo "and will be automatically cleaned up when running the down command."
+		echo ""
+		echo ""
+		echo "RECOMMENDED IPV6 ALLOCATION"
+		echo ""
+		echo "  <prefix> : <server> : <subnet> : <unused> : <interface-identifier>"
+		echo ""
+		echo "Where:"
+		echo " -> prefix is a unique identifier for this virtual private network."
+		echo " -> server is a unique identifier for each individual server (i.e. site)."
+		echo " -> subnet isolates clients from each other that are in different subnets."
+		echo " -> unused is a further custom distinction of client groups, may be left zero."
+		echo " -> interface-identifier is a 64-bit identifier reserved to uniquely identify"
+		echo "    clients across multiple subnets and groups. By default this is the"
+		echo "    MAC-address of the client."
+		echo ""
+		echo ""
+		echo "TROUBLESHOOTING"
+		echo ""
+		echo " 1. Check if interface is up and has the intended virtual IPv6-address"
+		echo " 2. Check if IPv6-forwarding is enabled, using:"
+		echo ""
+		echo "      cat /proc/sys/net/ipv6/conf/<wg0|all>/forwarding"
+		echo ""
+		echo " 3. Check if the virtual IPv6-address is routed correctly, using:"
+		echo ""
+		echo "      ip -6 route show [dev wg0]"
+		echo ""
+		echo " 4. Check if the route is blocked by netfilter with ip6tables:"
+		echo ""
+		echo "      ip6tables -L"
+		echo ""
+		echo " 5. Check from the client's perspective if the Endpoint IP-address in"
+		echo "    the [Peer] section that belongs to the server is correct."
+		echo " 6. Check if the port in the Endpoint from step 5 is correct."
+		echo " 7. Check if the port from step 6 matches the ListenPort on the server:"
+		echo "    wg show <wg0> listen-port"
+		echo " 8. Check if the PublicKey entry of the [Peer] section matches the"
+		echo "    PublicKey generated from the PrivateKey of the [Interface] section"
+		echo "    of the other peer. Check both ends. If one end is misconfigured,"
+		echo "    then the whole connection fails."
+		echo ""
+		echo "Wireguard uses the UDP-protocol, the wg-autoconf utility uses TCP-protocol."
+		echo "Debug UDP traffic using:"
+		echo ""
+		echo "    tcpdump -n udp"
+		echo ""
+		echo "If ping to a virtual address fails with:"
+		echo ""
+		echo "    Destination unreachable: Address unreachable"
+		echo ""
+		echo "then the traffic is correctly locally routed through the Wireguard link"
+		echo "device, but Wireguard responds that the virtual target IPv6-address is"
+		echo "unreachable. Check the AllowedIPs of the relevant [Peer] section."
+		echo ""
+		echo "Wireguard will give a warning:"
+		echo ""
+		echo "    warning: AllowedIP has nonzero host part"
+		echo ""
+		echo "which can be safely ignored. It indicates a subnet mask catches more than"
+		echo "one specific IPv6-address, and thus for clarity it should end with zeroes"
+		echo "(::). But wg-autoconf specifies the address anyway, to store the IP-address"
+		echo "of the server itself."
+		echo ""
+		echo "If a server is added to the mesh, all previously connected peers (clients"
+		echo "and servers) must reconnect using wg-autoconf. So that the new IP-addresses"
+		echo "are propagated. If the mesh is dynamic, it is highly recommended to use"
+		echo "wg-monitor which automatically propagates updates through the mesh network"
+		echo "and furthermore keeps connections alive (to achieve redundancy)."
+		echo ""
+		echo ""
+		
+	fi
+}
 
-if [ "$opts_context" = "wg" ]
-then
+
+context_wg()
+{
+	opts_command="$1"
+	shift
+	
 	[ -z "$1" ] || opts_interface="$1"
+	read -r chain < <(strtoupper "${opts_interface//-/_}")
 	
-	conf_file="/etc/wireguard/$opts_interface.conf"
+	# TODO: check if opts_interface name is too long, this is also limited by the max. length of ip6tables rules +'_FW_ALLOW' = +9 chars, error if too long
 	
-	if [ "$opts_command" = "down" ] || [ "$opts_command" = "up" ] || [ "$opts_command" = "update" ]
-	then
-		
-		read -r chain < <(strtoupper "${opts_interface//-/_}_FW")
-		chain_allow="${chain}_ALLOW"
-		read -r masq_chain < <(strtoupper "${opts_interface//-/_}_PR")
-		
-		read -r listen_port < <("$0" -i "$opts_interface" conf get-interface ListenPort)
-		
-		if [ "$opts_command" = "down" ]
-		then
-			[ -n "$listen_port" ] || read -r listen_port < <("$0" wg show "$opts_interface" listen-port)
-			[ -n "$listen_port" ] || listen_port="$WIREGUARD_PORT"
-			
-			# ignore any failures
-			
+	case "$opts_command" in
+		down)
 			# delete link device (which automatically removes all routes relating to this device)
 			cmd ip link delete dev "$opts_interface"
 			
 			# cleanup ip6tables rules after device is removed and down
-			cmd ip6tables -D INPUT -p udp --dport "$listen_port" -j ACCEPT
-			cmd ip6tables -D INPUT -p tcp --dport "$listen_port" -j ACCEPT
-			cmd ip6tables -D INPUT -i "$opts_interface" -j ACCEPT
-			cmd ip6tables -D "$chain" -j "$chain_allow"
-			cmd ip6tables -F "$chain_allow"
-			cmd ip6tables -X "$chain_allow"
-			cmd ip6tables -D FORWARD -i "$opts_interface" -j "$chain"
-			cmd ip6tables -F "$chain"
-			cmd ip6tables -X "$chain"
-			cmd ip6tables -t nat -D POSTROUTING -j "$masq_chain"
-			cmd ip6tables -t nat -F "$masq_chain"
-			cmd ip6tables -t nat -X "$masq_chain"
-		
-		elif [ "$opts_command" = "up" ] || [ "$opts_command" = "update" ]
-		then
-			set -e # exit on any failure
+			cmd ip6tables -D INPUT -j "$chain"_IN
+			cmd ip6tables -F "$chain"_IN
+			cmd ip6tables -X "$chain"_IN
 			
-			if ! [ -e "$conf_file" ]
+			cmd ip6tables -D FORWARD -i "$opts_interface" -j "$chain"_FW
+			cmd ip6tables -F "$chain"_FW
+			cmd ip6tables -X "$chain"_FW
+			
+			cmd ip6tables -D "$chain"_FW -j "$chain"_FW_MASQ
+			cmd ip6tables -F "$chain"_FW_MASQ
+			cmd ip6tables -X "$chain"_FW_MASQ
+			
+			cmd ip6tables -D "$chain"_FW -p udp -j "$chain"_FW_ALLOW
+			cmd ip6tables -F "$chain"_FW_ALLOW
+			cmd ip6tables -X "$chain"_FW_ALLOW
+			
+			cmd ip6tables -t nat -D POSTROUTING -j "$chain"_MASQ
+			cmd ip6tables -t nat -F "$chain"_MASQ
+			cmd ip6tables -t nat -X "$chain"_MASQ
+		;;
+		up|update)
+			# exit on any failure
+			set -e
+			
+			if ! [ -e "/etc/wireguard/$opts_interface.conf" ]
 			then
-				echo "error: Configuration file does not exist ($conf_file). Use the 'listen' (on a server) or 'connect' (on a client) command to initialize the Wireguard interface ($opts_interface)."
+				echo "error: Configuration file does not exist (/etc/wireguard/$opts_interface.conf)."
+				echo "Initialize the Wireguard interface ($opts_interface) for the first time using either:"
+				echo ""
+				echo "  $0 -i $opts_interface server listen"
+				echo ""
+				echo "or:"
+				echo ""
+				echo "  $0 -i $opts_interface client connect <server>"
+				echo ""
+				echo "Alternatively, read the manual for correct usage with:"
+				echo ""
+				echo "  $0 --help"
+				echo ""
 				exit 1
 			fi
 			
 			wg_confset="syncconf"
-		
+			
 			if ! [ -e "/sys/class/net/$opts_interface" ]
 			then
 				# first time set configuration
@@ -709,122 +661,44 @@ then
 				
 				# create link device
 				cmd ip link add "$opts_interface" type wireguard
-				
-				# detect automatically allocated ListenPort
-				[ -n "$listen_port" ] || read -r listen_port < <("$0" wg show "$opts_interface" listen-port)
-				[ -n "$listen_port" ] || listen_port="$WIREGUARD_PORT"
-				
-				# apply ip6tables rules before the device is up, but after device is created
-				cmd ip6tables -I INPUT -p udp --dport "$listen_port" -j ACCEPT
-				cmd ip6tables -I INPUT -p tcp --dport "$listen_port" -j ACCEPT
-				cmd ip6tables -I INPUT -i "$opts_interface" -j ACCEPT
-				cmd ip6tables -N "$chain"
-				cmd ip6tables -A FORWARD -i "$opts_interface" -j "$chain"
-				cmd ip6tables -A "$chain" -m state --state INVALID -j DROP
-				cmd ip6tables -A "$chain" -m state --state RELATED,ESTABLISHED -j ACCEPT
-				cmd ip6tables -N "$chain_allow"
-				cmd ip6tables -A "$chain" -j "$chain_allow"
-				cmd ip6tables -A "$chain" -j DROP
-				cmd ip6tables -t nat -N "$masq_chain"
-				cmd ip6tables -t nat -I POSTROUTING 1 -j "$masq_chain"
 			fi
 			
-			# for every server:
-			# if ServerEndpoint is defined, resolve it, and apply to Endpoint, done
-			# if MeshEndpoint is defined, resolve it, and apply to Endpoint, done
-			# if Endpoint is defined, resolve it, and apply to Endpoint, done
-			todo_resolved=()
-			server_PublicKey=""
-			server_Endpoint=""
-			server_MeshEndpoint=""
-			server_ServerEndpoint=""
-			process_server()
-			{
-				# check if there is a server section to process
-				[ -n "$server_PublicKey" ] || return 0
-				
-				# check if there is an endpoint to resolve
-				resolve_host="$server_ServerEndpoint"
-				[ -n "$resolve_host" ] || resolve_host="$server_MeshEndpoint"
-				[ -n "$resolve_host" ] || resolve_host="$server_Endpoint"
-				[ -n "$resolve_host" ] || return 0
-				
-				resolved_host=""
-				case "$resolve_host" in
-					\[*\]:*)
-						# IPv6 address with port
-						resolved_host="$resolve_host"
-					;;
-					[0-9].[0-9].[0-9].[0-9]:*)
-						# IPv4 address with port
-						resolved_host="$resolve_host"
-					;;
-					*:*)
-						# hostname with or without port
-						read -r resolved_host _ < <(getent hosts "${resolve_host%:*}") || true
-						
-						if [ -n "$resolved_host" ]
-						then
-							read -r resolved_host < <(ensure_ipv6_brackets "$resolved_host")
-							resolved_host="$resolved_host:${resolve_host##*:}"
-						fi
-					;;
-				esac
-				
-				if [ -n "$resolved_host" ] && [ "$resolved_host" != "$server_Endpoint" ]
-				then
-					# resolved host found, and is not the same as the current Endpoint, so update configuration and overwrite Endpoint
-					# but since we have a file lock on the configuration right now, we can only do it later on
-					todo_resolved+=("$server_PublicKey" "$resolved_host")
-				fi
-			}
-			while read -r line
-			do
-				# ServerEndpoint, MeshEndpoint, and Endpoint should already contain a port, if the port is not defined, fallback to WIREGUARD_PORT
-				
-				# if Peer section detected, then it's a new server
-				
-				if [ "${line:0:1}" = "[" ]
-				then
-					process_server
-					
-					server_PublicKey=""
-					server_Endpoint=""
-					server_MeshEndpoint=""
-					server_ServerEndpoint=""
-					
-					continue
-				fi
-				
-				case "${line// /}" in
-					PublicKey=*)
-						read -r server_PublicKey <<<"${line#*=}"
-					;;
-					Endpoint=*)
-						read -r server_Endpoint <<<"${line#*=}"
-					;;
-					MeshEndpoint=*)
-						read -r server_MeshEndpoint <<<"${line#*=}"
-					;;
-					ServerEndpoint=*)
-						read -r server_ServerEndpoint <<<"${line#*=}"
-					;;
-				esac
-				
-			done < <("$0" -i "$opts_interface" conf list-servers)
-			process_server
+			# apply ip6tables rules before the device is up, but after device is created
+			if cmd ip6tables -N "$chain"_IN
+			then
+				# cmd ip6tables -A "$chain"_IN -p udp -i "$opts_interface" -j ACCEPT
+				cmd ip6tables -I INPUT -j "$chain"_IN
+			fi
 			
-			for ((i=0;i<${#todo_resolved[@]};++i))
-			do
-				server_PublicKey="${todo_resolved[i]}"
-				i=$((i+1))
-				server_Endpoint="${todo_resolved[i]}"
-				
-				echo "info: For Peer[$server_PublicKey] resolved DNS Endpoint to a new address: $server_Endpoint"
-				"$0" -i "$opts_interface" conf set-peer "$server_PublicKey" <<EOF
-Endpoint = $server_Endpoint
-EOF
-			done
+			if cmd ip6tables -N "$chain"_FW
+			then
+				cmd ip6tables -A "$chain"_FW -m state --state INVALID -j DROP
+				cmd ip6tables -A "$chain"_FW -m state --state RELATED,ESTABLISHED -j ACCEPT
+				cmd ip6tables -A "$chain"_FW -j DROP
+				cmd ip6tables -I FORWARD -i "$opts_interface" -j "$chain"_FW
+			fi
+			
+			if cmd ip6tables -N "$chain"_FW_ALLOW
+			then
+				# there are 3 rules in "$chain"_FW, add before the DROP
+				cmd ip6tables -I "$chain"_FW 3 -p udp -j "$chain"_FW_ALLOW
+			fi
+			
+			if cmd ip6tables -N "$chain"_FW_MASQ
+			then
+				# there are 3 rules in "$chain"_FW, add before the DROP
+				cmd ip6tables -I "$chain"_FW 3 -j "$chain"_FW_MASQ
+			fi
+			
+			if cmd ip6tables -t nat -N "$chain"_MASQ
+			then
+				cmd ip6tables -t nat -I POSTROUTING -j "$chain"_MASQ
+			fi
+			
+			iptables_chain_in=0
+			iptables_chain_fw_allow=0
+			iptables_chain_fw_masq=0
+			iptables_chain_masq=0
 			
 			# only set interface up if "up" command, with "update", don't actually bring the interface up
 			if [ "$opts_command" = "up" ]
@@ -833,8 +707,37 @@ EOF
 				cmd ip link set mtu "$DEFAULT_MTU" up dev "$opts_interface"
 			fi
 			
+			# accept all input/output traffic for the Wireguard device (for any port)
+			cmd ip6tables -I "$chain"_IN 1 -i "$opts_interface" -j ACCEPT
+			((++iptables_chain_in))
+			
+			insert_ip6tables_listenport()
+			{
+				cmd ip6tables -I "$chain"_IN 1 -p udp --dport "$listen_port" -j ACCEPT
+				((++iptables_chain_in))
+				
+				cmd ip6tables -I "$chain"_IN 1 -p tcp --dport "$listen_port" -j ACCEPT
+				((++iptables_chain_in))
+			}
+			
+			# detect automatically allocated ListenPort
+			read -r listen_port < <("$0" -i "$opts_interface" conf get-interface ListenPort) || true
+			
+			# add rules to allow ListenPort BEFORE applying the configuration (for seamless transition to another ListenPort)
+			[ -z "$listen_port" ] || insert_ip6tables_listenport
+			
 			# synchronize configuration with wireguard (use wg-quick if available, for custom rules fallback)
-			cmd "$0" wg "$wg_confset" "$opts_interface" <("$0" -i "$opts_interface" conf strip)
+			# a dynamic ListenPort is assigned if no ListenPort is explicitly set
+			cmd "$0" "$wg_confset" "$opts_interface" <("$0" -i "$opts_interface" conf strip)
+			
+			# if no ListenPort is explicitly set, grab the dynamically assigned one, and update ip6tables rules
+			if [ -z "$listen_port" ]
+			then
+				read -r listen_port < <("$0" show "$opts_interface" listen-port) || true
+				[ -n "$listen_port" ] || listen_port="$WIREGUARD_PORT"
+				
+				insert_ip6tables_listenport
+			fi
 			
 			# gather prefixes, for ip6tables rules later on
 			prefixes=()
@@ -870,10 +773,12 @@ EOF
 				esac
 				
 				# allow any traffic from this server to anywhere else
-				ensure_ip6tables -A "$chain_allow" -s "${address%/*}/128" -j ACCEPT
+				cmd ip6tables -I "$chain"_FW_ALLOW 1 -s "${address%/*}/128" -j ACCEPT
+				((++iptables_chain_fw_allow))
 				
 				# allow anyone to access this server
-				ensure_ip6tables -A "$chain_allow" -d "${address%/*}/128" -j ACCEPT
+				cmd ip6tables -I "$chain"_FW_ALLOW 1 -d "${address%/*}/128" -j ACCEPT
+				((++iptables_chain_fw_allow))
 				
 				# gather prefixes for ip6tables rules later on
 				case "$address" in
@@ -896,6 +801,8 @@ EOF
 				echo "warning: Device $opts_interface has no virtual IPv6-address assigned. Check [Interface] Address configuration." >&2
 			fi
 			
+			max_relay_cost="0"
+			
 			# one IP per line, multiple lines may belong to one peer
 			while read -r address
 			do
@@ -914,14 +821,31 @@ EOF
 				# increase relay cost for once, since this is a server
 				relay_cost="$((relay_cost + 1))"
 				
+				# keep track of maximum relay cost
+				[ "$relay_cost" -le "$max_relay_cost" ] || max_relay_cost="$relay_cost"
+				
+				# check if IPv4 address (to catch as masquerade)
+				#case "$address" in
+				#	*.*.*.*)
+				#		ensure_ip4route "${address%\$*}" dev "$opts_interface" metric "$((RELAY_METRIC_FACTOR * relay_cost + LOCAL_METRIC))"
+				#		
+				#		# skip the rest
+				#		continue
+				#	;;
+				#esac
+				
 				# grab the mask, and ensure any traffic directed at this prefix is routed to the wireguard link
 				ensure_ip6route "${address%\$*}" dev "$opts_interface" metric "$((RELAY_METRIC_FACTOR * relay_cost + LOCAL_METRIC))"
 				
 				# allow any traffic from this server to anywhere else
-				ensure_ip6tables -A "$chain_allow" -s "${address%/*}/128" -j ACCEPT
+				cmd ip6tables -I "$chain"_FW_ALLOW 1 -s "${address%/*}/128" -j ACCEPT
+				((++iptables_chain_fw_allow))
+				
+				read -r normalized_address < <(apply_ipv6_mask "${address%\$*}")
 				
 				# allow any outgoing traffic to the subnet of the other server, that server will need to check if the incoming traffic is allowed
-				ensure_ip6tables -A "$chain_allow" -d "${address%\$*}" -j ACCEPT
+				cmd ip6tables -I "$chain"_FW_ALLOW 1 -d "$normalized_address" -j ACCEPT
+				((++iptables_chain_fw_allow))
 				
 				# gather prefixes for ip6tables rules later on
 				case "$address" in
@@ -940,8 +864,18 @@ EOF
 				
 			done < <("$0" -i "$opts_interface" conf list-servers AllowedIPs)
 			
+			# as a client, make sure all traffic for the available prefixes is routed to the given wireguard interface (but at a lowest priority, so individual servers can come first where needed)
+			for prefix in "${prefixes[@]}"
+			do
+				read -r addr < <(hex_to_expanded_ipv6 "${prefix:0:$((opts_prefix_mask / 4))}")
+				
+				ensure_ip6route "$addr/$opts_prefix_mask" dev "$opts_interface" metric "$((RELAY_METRIC_FACTOR * (max_relay_cost + 1) + LOCAL_METRIC))"
+			done
+			
 			# keep track of groups, and do only one aggregated ip6tables update
 			groups=()
+			
+			echo "allowing anyone to access this client from same subnet"
 			
 			# allow anyone to access this incoming client, as long as they are from the same subnet
 			while read -r allowed_ip
@@ -960,7 +894,7 @@ EOF
 				subnet_prefix="$addr"
 				
 				# insert colons every 4 digits
-				read -r addr < <(echo "$addr" | sed -e 's/.\{4\}/&:/g;s/:$//')
+				read -r addr < <(hex_to_expanded_ipv6 "$addr")
 				
 				# add a mask
 				addr="$addr/$opts_subnet_mask"
@@ -974,9 +908,10 @@ EOF
 				for prefix in "${prefixes[@]}"
 				do
 					# replace addr with prefix, prefix is already limited to its mask, and expanded IPv6 without colons, and only is added to prefixes iff the prefix mask is less than the subnet mask
+					read -r addr < <(hex_to_expanded_ipv6 "$prefix${subnet_prefix:${#prefix}}")
 					
 					# compress_ipv6 also adds :: at the end, and preserves mask
-					read -r group_addr < <(compress_ipv6 "$prefix${subnet_prefix:${#prefix}}/$opts_subnet_mask")
+					read -r group_addr < <(compress_ipv6 "$addr/$opts_subnet_mask")
 					
 					# allow where: group_addr is the source, local_group_addr is the destination
 					groups+=("$group_addr" "$local_group_addr")
@@ -986,34 +921,62 @@ EOF
 			
 			if [ "${#groups[@]}" -ne 0 ]
 			then
-				# create rules, but only if not exists yet in ip6tables-save
-				printf -- "-A $chain_allow -s %s -d %s -o $opts_interface -j ACCEPT\n" "${groups[@]}" | sort | uniq | grep -v -x -F -f <(ip6tables-save) | while read -r rule
+				# insert rules, but only if unique (prevent one rule per client)
+				printf -- "-I ${chain}_FW_ALLOW 1 -s %s -d %s -o $opts_interface -j ACCEPT\n" "${groups[@]}" | sort | uniq | while read -r rule
 				do
 					cmd ip6tables $rule
+					((++iptables_chain_fw_allow))
 				done
 			fi
 			
-	#	# if masquerading is allowed
-	#	if [ -e "$opts_masq_interface" ]
-	#	then
-	#		# allow traffic from the masq interface back into the tunnel
-	#		cmd ip6tables -A "$chain_allow" -i "$opts_masq_interface" -o "$opts_interface" -j ACCEPT
-	#		
-	#		# for every Peer for which MASQUERADE is allowed, do:
-	#		# prepend prefix + subnet if starts with a single colon
-	#		case "$client_addr" in
-	#			::*) ;;
-	#			:*) client_addr="$opts_vpn_prefix$opts_vpn_subnet$client_addr"
-	#		esac
-	#		
-	#		# masquerade any traffic in the POSTROUTING chain from this address to any non-'virtual network' to the given interface
-	#		ensure_ip6tables -t nat -A $masq_chain -s "$client_addr" -d ! "$opts_vpn_prefix::$prefix_mask" -o "$opts_masq_interface" -j MASQUERADE
-	#
-	#		# specifically allow any traffic from the wireguard tunnel from that address, to be accepted into the target interface
-	#		ensure_ip6tables -A $chain_allow -i "$opts_interface" -s "$client_addr" -o "$opts_masq_interface" -j ACCEPT
-	#
-	#		# any other traffic that was not matched will automatically be dropped, unless whitelisted by $chain_allow
-	#	fi
+			if [ -z "$opts_masquerade_interface" ]
+			then
+				# grab masquerade interface from configuration
+				read -r opts_masquerade_interface < <("$0" conf get-interface MasqueradeInterface) || true
+			fi
+			
+			echo "info: Masquerading to link device ($opts_masquerade_interface)."
+			
+			# if masquerading is allowed
+			if [ -n "$opts_masquerade_interface" ]
+			then
+				# allow traffic from the masq interface back into the tunnel
+				cmd ip6tables -I "$chain"_FW_MASQ 1 -i "$opts_masquerade_interface" -o "$opts_interface" -j ACCEPT
+				((++iptables_chain_fw_masq))
+				
+				while read -r allowed_ip
+				do
+					[ -n "$allowed_ip" ] || continue
+					
+					# because of -I, the order here is reversed, so first add the passthrough chain rule
+					
+					echo "info: Masquerading is allowed for client with AllowedIPs: $allowed_ip"
+					
+					# masquerade any leftover non-virtual traffic in the POSTROUTING chain to the given interface
+					cmd ip6tables -t nat -I "$chain"_MASQ 1 -s "$allowed_ip" -o "$opts_masquerade_interface" -j MASQUERADE
+					((++iptables_chain_masq))
+					
+					# and now add RETURN rules, in case the traffic is intended for the virtual network
+					for prefix in "${prefixes[@]}"
+					do
+						read -r addr < <(hex_to_expanded_ipv6 "${prefix:0:$((opts_prefix_mask / 4))}")
+						
+						# don't masquerade if traffic from this allowed ip goes to a virtual address prefix
+						cmd ip6tables -t nat -I "$chain"_MASQ 1 -s "$allowed_ip" -d "$addr/$opts_prefix_mask" -o "$opts_masquerade_interface" -j RETURN
+						((++iptables_chain_masq))
+					done
+					
+					# specifically allow any traffic from the wireguard tunnel from that address, to be accepted into the target interface
+					cmd ip6tables -I "$chain"_FW_ALLOW 1 -s "$allowed_ip" -o "$opts_masquerade_interface" -j ACCEPT
+					((++iptables_chain_fw_allow))
+					
+				done < <("$0" -i "$opts_interface" conf list-clients AllowedIPs)
+				
+				# any other traffic that was not matched will automatically be dropped, unless whitelisted by $chain_allow
+				
+				# so that allows anything coming in on the masq interface? but that's weird...
+				# also allow INPUT for: ip6tables -I INPUT -i "$opts_masquerade_interface" -p udp --dport LISTEN_PORT -j ACCEPT
+			fi
 			
 			# clients must always be part of a subnet of a server, so no routing rules required for those
 			# because the server should already have a mask
@@ -1022,36 +985,70 @@ EOF
 			cmd sysctl net.ipv6.conf.all.accept_ra=2
 			cmd sysctl net.ipv6.conf.all.forwarding=1
 			
-			"$0" wg show "$opts_interface"
+			# delete old rules
+			while cmd ip6tables -D "$chain"_IN "$((iptables_chain_in + 1))"
+			do
+				echo "info: Removed old rule from ${chain}_IN"
+			done
+			while cmd ip6tables -D "$chain"_FW_ALLOW "$((iptables_chain_fw_allow + 1))"
+			do
+				echo "info: Removed old rule from ${chain}_FW_ALLOW"
+			done
+			while cmd ip6tables -D "$chain"_FW_MASQ "$((iptables_chain_fw_masq + 1))"
+			do
+				echo "info: Removed old rule from ${chain}_FW_MASQ."
+			done
+			while cmd ip6tables -t nat -D "$chain"_MASQ "$((iptables_chain_masq + 1))"
+			do
+				echo "info: Removed old rule from ${chain}_MASQ."
+			done
+			
+			"$0" show "$opts_interface"
 			
 			echo "info: Success"
-		fi
-		
-	else
-		cmd=(wg)
-		if [ -n "$opts_command" ]; then cmd+=("$opts_command"); fi
-		if [ "$#" -gt 0 ]; then cmd+=("$@"); fi
-		exec "${cmd[@]}"
-	fi
+		;;
+	esac
+}
 
-elif [ "$opts_context" = "conf" ]
-then
+
+context_conf()
+{
+	opts_command="$1"
+	shift
+	
 	conf_file="/etc/wireguard/$opts_interface.conf"
 	
-	if [ "$opts_command" = "has-address" ]
-	then
-		# usage note: address must be a single and compressed IPv6 address
-		
-		# remove comments from conf_file, and then check if the address exists in ANY section in ANY key
-		# TODO: make this more strict, only check Address and AllowedIPs entries in Interface and Peer sections respectively
-		
-		if grep -qE '(,|\s|=)'"$1"'([/$],|\s|$)' <(sed -r -e 's/#.*$//g' <"$conf_file")
-		then
+	case "$opts_command" in
+		has-address)
+			
+			# usage note: address must be a single and compressed IPv6 address
+			
+			# remove comments from conf_file, and then check if the address exists in ANY section in ANY key
+			# TODO: make this more strict, only check Address and AllowedIPs entries in Interface and Peer sections respectively
+			
+			if grep -qE '(,|\s|=)'"$1"'([/$],|\s|$)' <(sed -r -e 's/#.*$//g' <"$conf_file")
+			then
+				exit 0
+			else
+				exit 1
+			fi
+		;;
+		strip)
+			
+			# print Interface-section
+			"$0" -i "$opts_interface" conf get-interface | sed -r -n -e '/^\s*(\[Interface\]|(PrivateKey|ListenPort|FwMark)\s*=)/p'
+			
+			# print all Peer-sections (and strip $cost metric from every IP in AllowedIPs)
+			"$0" -i "$opts_interface" conf list-peers | sed -r -n -e '/^\s*AllowedIPs\s*=/ s/[$][0-9]+//g' -e '/^\s*(\[Peer\]|(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)\s*=)/p'
+			
+			# TODO: the "AllowedIP has nonzero host part" warning can be prevented by filtering the config accordingly (in: wg-autoconf conf strip)
+			# this can only be done by parsing every AllowedIP, expanding the IPv6 address, setting every digit beyond the subnet mask to zero, and then compressing again, before printing it
+			
 			exit 0
-		else
-			exit 1
-		fi
-	fi
+		;;
+	esac
+	
+	# advanced config rewriting or printing:
 	
 	set -e # exit on any failure
 	
@@ -1060,18 +1057,17 @@ then
 		interface_PrivateKey=""
 		interface_Address=()
 		interface_ListenPort=""
-		interface_ServerEndpoint=""
-		interface_MeshEndpoint=""
+		interface_Endpoint=""
 		interface_InterfaceID=""
 		interface_SubnetMask=""
+		interface_MasqueradeInterface=""
 		
 		peer_PublicKey=""
 		peer_Endpoint=""
 		peer_AllowedIPs=()
 		peer_PersistentKeepalive=""
 		peer_Type=""
-		peer_ServerEndpoint=""
-		peer_MeshEndpoint=""
+		peer_Masquerade=""
 		
 		section_buffer=()
 		section=""
@@ -1091,8 +1087,7 @@ then
 				done
 			fi
 			[ -z "$interface_ListenPort" ] || echo "ListenPort = $interface_ListenPort"
-			[ -z "$interface_ServerEndpoint" ] || echo "ServerEndpoint = $interface_ServerEndpoint"
-			[ -z "$interface_MeshEndpoint" ] || echo "MeshEndpoint = $interface_MeshEndpoint"
+			[ -z "$interface_Endpoint" ] || echo "Endpoint = $interface_Endpoint"
 			[ -z "$interface_InterfaceID" ] || echo "InterfaceID = $interface_InterfaceID"
 			[ -z "$interface_SubnetMask" ] || echo "SubnetMask = $interface_SubnetMask"
 			
@@ -1116,8 +1111,7 @@ then
 				done
 			fi
 			[ -z "$peer_PersistentKeepalive" ] || echo "PersistentKeepalive = $peer_PersistentKeepalive"
-			[ -z "$peer_ServerEndpoint" ] || echo "ServerEndpoint = $peer_ServerEndpoint"
-			[ -z "$peer_MeshEndpoint" ] || echo "MeshEndpoint = $peer_MeshEndpoint"
+			[ -z "$peer_Masquerade" ] || echo "Masquerade = $peer_Masquerade"
 		fi
 		
 		if [ "${#section_buffer[@]}" -gt 0 ]
@@ -1132,7 +1126,7 @@ then
 	}
 	peer_is_server()
 	{
-		if [ "$peer_Type" = "server" ] || [ -n "$peer_Endpoint" ] || [ -n "$peer_ServerEndpoint" ] || [ -n "$peer_MeshEndpoint" ]
+		if [ "$peer_Type" = "server" ] || [ -n "$peer_Endpoint" ]
 		then
 			return 0
 		fi
@@ -1160,601 +1154,495 @@ then
 		echo -n # nothing to add
 	}
 	
-	if [ "$opts_command" = "strip" ]
-	then
-		# print Interface-section
-		"$0" -i "$opts_interface" conf get-interface | sed -r -n -e '/^\s*(\[Interface\]|(PrivateKey|ListenPort|FwMark)\s*=)/p'
-		
-		# print all Peer-sections (and strip $cost metric from every IP in AllowedIPs)
-		"$0" -i "$opts_interface" conf list-peers | sed -r -n -e '/^\s*AllowedIPs\s*=/ s/[$][0-9]+//g' -e '/^\s*(\[Peer\]|(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)\s*=)/p'
-		
-		exit 0
-	
-	elif [ "$opts_command" = "list-peers" ] || [ "$opts_command" = "list-servers" ] || [ "$opts_command" = "list-clients" ]
-	then
-		process_section()
-		{
-			if [ "$section" != "Peer" ] || [ -z "$peer_PublicKey" ]
-			then
-				return 0
-			fi
-			
-			if [ "$opts_command" = "list-servers" ] || [ "$opts_command" = "list-clients" ]
-			then
-				# a server is defined by either having an Endpoint, or having an AllowedIPs bitmask < 128
-				if peer_is_server
+	case "$opts_command" in
+		list-peers|list-servers|list-clients)
+			process_section()
+			{
+				if [ "$section" != "Peer" ] || [ -z "$peer_PublicKey" ]
 				then
-					if [ "$opts_command" != "list-servers" ]
+					return 0
+				fi
+				
+				if [ "$opts_command" = "list-servers" ] || [ "$opts_command" = "list-clients" ]
+				then
+					# a server is defined by either having an Endpoint, or having an AllowedIPs bitmask < 128
+					if peer_is_server
 					then
-						return 0
-					fi
-					
-				else # is client
-					
-					if [ "$opts_command" != "list-clients" ]
-					then
-						return 0
+						if [ "$opts_command" != "list-servers" ]
+						then
+							return 0
+						fi
+						
+					else # is client
+						
+						if [ "$opts_command" != "list-clients" ]
+						then
+							return 0
+						fi
 					fi
 				fi
-			fi
-			
-			if [ "$1" = "PublicKey" ]
-			then
-				[ -z "$peer_PublicKey" ] || echo "$peer_PublicKey"
 				
-			elif [ "$1" = "AllowedIPs" ]
-			then
-				for allowed_ip in "${peer_AllowedIPs[@]}"
-				do
-					echo "$allowed_ip"
-				done
-			
-			elif [ "$1" = "Endpoint" ]
-			then
-				# the IPv6-address we chose
-				[ -z "$peer_Endpoint" ] || echo "$peer_Endpoint"
-			
-			elif [ "$1" = "ServerEndpoint" ]
-			then
-				# the DNS-record the server supplied for its own node
-				[ -z "$peer_ServerEndpoint" ] || echo "$peer_ServerEndpoint"
-				
-			elif [ "$1" = "MeshEndpoint" ]
-			then
-				# the DNS-record the server supplied for its mesh network
-				[ -z "$peer_MeshEndpoint" ] || echo "$peer_MeshEndpoint"
-				
-			elif [ -n "$1" ]
-			then
-				return 1
-				
-			else
-				print_section_buffer
-			fi
-		}
-	
-	elif [ "$opts_command" = "get-interface" ]
-	then
-		section_matched=false
-		
-		process_section()
-		{
-			if [ "$section" = "Interface" ]
-			then
-				section_matched=true
-				
-				if [ "$1" = "Address" ]
+				if [ "$1" = "PublicKey" ]
 				then
-					for address in "${interface_Address[@]}"
+					[ -z "$peer_PublicKey" ] || echo "$peer_PublicKey"
+					
+				elif [ "$1" = "AllowedIPs" ]
+				then
+					for allowed_ip in "${peer_AllowedIPs[@]}"
 					do
-						echo "$address"
+						echo "$allowed_ip"
 					done
-
-				elif [ "$1" = "PrivateKey" ]
-				then
-					[ -z "$interface_PrivateKey" ] || echo "$interface_PrivateKey"
-
-				elif [ "$1" = "ListenPort" ]
-				then
-					[ -z "$interface_ListenPort" ] || echo "$interface_ListenPort"
 				
-				elif [ "$1" = "ServerEndpoint" ]
+				elif [ "$1" = "Endpoint" ]
 				then
-					[ -z "$interface_ServerEndpoint" ] || echo "$interface_ServerEndpoint"
-					
-				elif [ "$1" = "MeshEndpoint" ]
+					# the IPv6-address we chose
+					[ -z "$peer_Endpoint" ] || echo "$peer_Endpoint"
+				
+				elif [ "$1" = "Masquerade" ]
 				then
-					[ -z "$interface_MeshEndpoint" ] || echo "$interface_MeshEndpoint"
-					
-				elif [ "$1" = "InterfaceID" ]
-				then
-					[ -z "$interface_InterfaceID" ] || echo "$interface_InterfaceID"
-					
-				elif [ "$1" = "SubnetMask" ]
-				then
-					[ -z "$interface_SubnetMask" ] || echo "$interface_SubnetMask"
+					# the DNS-record the server supplied for its mesh network
+					[ -z "$peer_Masquerade" ] || echo "$peer_Masquerade"
 					
 				elif [ -n "$1" ]
-				then 
+				then
 					return 1
+					
 				else
 					print_section_buffer
 				fi
-			fi
-		}
-		process_eof()
-		{
-			if ! $section_matched && [ -z "$1" ]
-			then
-				# print empty Interface, by default, if non-existing Interface section
-				echo "[Interface]"
-			fi
-		}
-		
-	elif [ "$opts_command" = "get-peer" ] || [ "$opts_command" = "get-server" ] || [ "$opts_command" = "get-client" ]
-	then
-		section_matched=false
-		
-		print_partial_peer()
-		{
-			if [ "$1" = "PublicKey" ]
-			then
-				[ -z "$peer_PublicKey" ] || echo echo "$peer_PublicKey"
-
-			elif [ "$1" = "AllowedIPs" ]
-			then
-				for allowed_ip in "${peer_AllowedIPs[@]}"
-				do
-					echo "$allowed_ip"
-				done
-				
-			elif [ "$1" = "PersistentKeepalive" ]
-			then
-				[ -z "$peer_PersistentKeepalive" ] || echo echo "$peer_PersistentKeepalive"
-				
-			elif [ "$1" = "Endpoint" ]
-			then
-				[ -z "$peer_Endpoint" ] || echo "$peer_Endpoint"
+			}
+		;;
+		get-interface)
+			section_matched=false
 			
-			elif [ "$1" = "ServerEndpoint" ]
-			then
-				[ -z "$peer_ServerEndpoint" ] || echo "$peer_ServerEndpoint"
-				
-			elif [ "$1" = "MeshEndpoint" ]
-			then
-				[ -z "$peer_MeshEndpoint" ] || echo "$peer_MeshEndpoint"
-			
-			elif [ "$1" = "Type" ]
-			then
-				[ -z "$peer_Type" ] || echo "$peer_Type"
-			elif [ -n "$1" ]
-			then
-				return 1
-			else
-				print_section_buffer
-			fi
-		}
-		process_section()
-		{
-			if [ "$section" = "Peer" ] && [ "$peer_PublicKey" = "$1" ]
-			then
-				if [ "$opts_command" = "get-peer" ]
+			process_section()
+			{
+				if [ "$section" = "Interface" ]
 				then
 					section_matched=true
-					print_partial_peer "$2"
 					
-				elif peer_is_server
-				then
-					if [ "$opts_command" = "get-server" ]
-					then
-						section_matched=true
-						print_partial_peer "$2"
-					fi
-				else
-					if [ "$opts_command" = "get-client" ]
-					then
-						section_matched=true
-						print_partial_peer "$2"
-					fi
+					case "$1" in
+						Address)
+							for address in "${interface_Address[@]}"
+							do
+								echo "$address"
+							done
+						;;
+						PrivateKey)
+							[ -z "$interface_PrivateKey" ] || echo "$interface_PrivateKey"
+						;;
+						ListenPort)
+							[ -z "$interface_ListenPort" ] || echo "$interface_ListenPort"
+						;;
+						Endpoint)
+							[ -z "$interface_Endpoint" ] || echo "$interface_Endpoint"
+						;;
+						InterfaceID)
+							[ -z "$interface_InterfaceID" ] || echo "$interface_InterfaceID"
+						;;
+						SubnetMask)
+							[ -z "$interface_SubnetMask" ] || echo "$interface_SubnetMask"
+						;;
+						MasqueradeInterface)
+							[ -z "$interface_MasqueradeInterface" ] || echo "$interface_MasqueradeInterface"
+						;;
+						'')
+							print_section_buffer
+						;;
+						*)
+							return 1
+						;;
+					esac
 				fi
-			fi
-		}
-		process_eof()
-		{
-			if ! $section_matched
-			then
-				# return non-zero exit code to indicate no Peer was matched
-				exit 1
-			fi
-		}
-
-	elif [ "$opts_command" = "set-peer" ] || [ "$opts_command" = "set-interface" ] || [ "$opts_command" = "set-client" ] || [ "$opts_command" = "set-server" ]
-	then
-		section_matched=false
-		
-		# check usage
-		if [ -z "$1" ] && {
-			[ "$opts_command" = "set-peer" ] || [ "$opts_command" = "set-client" ] || [ "$opts_command" = "set-server" ]
-		}
-		then
-			echo "error: Invalid usage."
-			echo "Usage: $0 conf $opts_command <public-key>"
-			exit 1
-		fi
-		
-		process_section()
-		{
-			# if already matched, just print section
-			if $section_matched
-			then
-				if ! print_section_buffer >&$write_fd
-				then
-					return $?
-				fi
-				return 0
-			fi
-			
-			# check if we can match section
-			if {
-				[ "$section" = "Interface" ] && [ "$opts_command" = "set-interface" ] && [ "$section" = "Interface" ]
-			} || {
-				[ "$section" = "Peer" ] && {
-					[ "$opts_command" = "set-peer" ] || [ "$opts_command" = "set-client" ] || [ "$opts_command" = "set-server" ]
-				} && [ "$peer_PublicKey" = "$1" ]
 			}
-			then
-				# read section from stdin, and overwrite values, if empty, it means to delete the value for that key
-				# if a key is not explicitly defined, it will always be preserved
-				
-				# mark matched, otherwise the section is new, and will be appended at the end
-				section_matched=true
-				
-				set_interface_Address=false
-				new_interface_Address=()
-				
-				set_peer_Type=false
-				set_peer_Endpoint=false
-				set_peer_AllowedIPs=false
-				set_peer_PersistentKeepalive=false
-				new_peer_Type=""
-				new_peer_Endpoint=""
-				new_peer_ServerEndpoint=""
-				new_peer_MeshEndpoint=""
-				new_peer_AllowedIPs=()
-				new_peer_PersistentKeepalive=""
-				
-				# you can use stdin or cli-args to set key&value pairs, but these methods cannot be mixed (enforce strict style consistency, to avoid bugs due to using undefined behavior if they are mixed and the implementation changes)
-				if [ "$#" -gt 1 ]
+			process_eof()
+			{
+				if ! $section_matched && [ -z "$1" ]
 				then
-					# now read from args[1...] KeyHere=Value or key-here value styles are both supported
-					key=""
-					for arg in "${@:1}"
-					do
-						store_value=false
-						
-						case "$arg" in
-							*=*)
-								key="${arg%%=*}"
-								value="${arg#*=}"
-								store_value=true
-							;;
-							*)
-								if [ -z "$key" ]
-								then
-									key="$arg"
-								else
-									value="$arg"
-									store_value=true
-								fi
-							;;
-						esac
-						
-						if $store_value
-						then
-							read -r key < <(strtolower "${key//-/}")
+					# print empty Interface, by default, if non-existing Interface section
+					echo "[Interface]"
+				fi
+			}
+		;;
+		get-peer|get-server|get-client)
+			section_matched=false
+			
+			print_partial_peer()
+			{
+				case "$1" in
+					PublicKey)
+						[ -z "$peer_PublicKey" ] || echo echo "$peer_PublicKey"
+					;;
+					AllowedIPs)
+						for allowed_ip in "${peer_AllowedIPs[@]}"
+						do
+							echo "$allowed_ip"
+						done
+					;;
+					PersistentKeepalive)
+						[ -z "$peer_PersistentKeepalive" ] || echo echo "$peer_PersistentKeepalive"
+					;;
+					Endpoint)
+						[ -z "$peer_Endpoint" ] || echo "$peer_Endpoint"
+					;;
+					Type)
+						[ -z "$peer_Type" ] || echo "$peer_Type"
+					;;
+					Masquerade)
+						[ -z "$peer_Masquerade" ] || echo "$peer_Masquerade"
+					;;
+					'')
+						print_section_buffer
+					;;
+					*)
+						# Invalid section-key
+						return 1
+					;;
+				esac
+			}
+			process_section()
+			{
+				if [ "$section" = "Peer" ] && [ "$peer_PublicKey" = "$1" ]
+				then
+					case "$opts_command" in
+						get-peer)
+							section_matched=true
+							print_partial_peer "$2"
+						;;
+						get-server)
+							if peer_is_server
+							then
+								section_matched=true
+								print_partial_peer "$2"
+							fi
+						;;
+						get-client)
+							if ! peer_is_server
+							then
+								section_matched=true
+								print_partial_peer "$2"
+							fi
+						;;
+					esac
+				fi
+			}
+			process_eof()
+			{
+				if ! $section_matched
+				then
+					# return non-zero exit code to indicate no Peer was matched
+					exit 1
+				fi
+			}
+		;;
+		set-peer|set-interface)
+			section_matched=false
+			
+			target_section=""
+			case "$opts_command" in
+				set-peer)
+					if [ "$#" -eq 0 ]
+					then
+						echo "error: Invalid usage."
+						echo "Usage: $0 conf set-peer <public-key>"
+						exit 1
+					fi
+					
+					target_section="Peer"
+					target_PublicKey="$1"
+				;;
+				set-interface)
+					target_section="Interface"
+				;;
+			esac
+			
+			process_section()
+			{
+				# if section not yet matched, and section matches target section, and PublicKey matches if peer
+				if ! $section_matched && [ "$section" = "$target_section" ] && {
+					[ "$target_section" != "Peer" ] || [ "$peer_PublicKey" = "$target_PublicKey" ]
+				}
+				then
+					# read section from stdin, and overwrite values, if empty, it means to delete the value for that key
+					# if a key is not explicitly defined, it will always be preserved
+					
+					# mark matched, otherwise the section is new, and will be appended at the end
+					section_matched=true
+					
+					set_interface_Address=false
+					new_interface_Address=()
+					
+					set_peer_Type=false
+					set_peer_Endpoint=false
+					set_peer_AllowedIPs=false
+					set_peer_PersistentKeepalive=false
+					new_peer_Type=""
+					new_peer_Endpoint=""
+					new_peer_AllowedIPs=()
+					new_peer_PersistentKeepalive=""
+					new_peer_Masquerade=""
+					
+					# you can use stdin or cli-args to set key&value pairs, but these methods cannot be mixed (enforce strict style consistency, to avoid bugs due to using undefined behavior if they are mixed and the implementation changes)
+					if [ "$#" -gt 1 ]
+					then
+						# now read from args[1...] KeyHere=Value or key-here value styles are both supported
+						key=""
+						for arg in "${@:1}"
+						do
+							store_value=false
 							
-							case "$section" in
+							case "$arg" in
+								*=*)
+									key="${arg%%=*}"
+									value="${arg#*=}"
+									store_value=true
+								;;
+								*)
+									if [ -z "$key" ]
+									then
+										key="$arg"
+									else
+										value="$arg"
+										store_value=true
+									fi
+								;;
+							esac
+							
+							if $store_value
+							then
+								read -r key < <(strtolower "${key//-/}")
+								
+								case "$section" in
+									Interface)
+										case "$key" in
+											privatekey)
+												read -r interface_PrivateKey <<<"$value"
+											;;
+											address)
+												set_interface_Address=true
+												split ',' "$value" new_interface_Address
+											;;
+											listenport)
+												read -r interface_ListenPort <<<"$value"
+											;;
+											endpoint)
+												read -r interface_Endpoint <<<"$value"
+											;;
+											interfaceid)
+												read -r interface_InterfaceID <<<"$value"
+											;;
+											subnetmask)
+												read -r interface_SubnetMask <<<"$value"
+											;;
+											masqueradeinterface)
+												read -r interface_MasqueradeInterface <<<"$value"
+											;;
+										esac
+									;;
+									Peer)
+										# note, PublicKey cannot be overwritten, since it's already used for matching
+										# if it is possible to change the PublicKey, then uniqueness of PublicKey's is not guaranteed
+										case "$key" in
+											type)
+												set_peer_Type=true
+												read -r new_peer_Type < <(strtolower "$value")
+											;;
+											endpoint)
+												set_peer_Endpoint=true
+												read -r new_peer_Endpoint <<<"$value"
+											;;
+											allowedips)
+												set_peer_AllowedIPs=true
+												split ',' "$value" new_peer_AllowedIPs
+											;;
+											persistentkeepalive)
+												set_peer_PersistentKeepalive=true
+												read -r new_peer_PersistentKeepalive <<<"$value"
+											;;
+											masquerade)
+												set_peer_Masquerade=true
+												read -r new_peer_Masquerade <<<"$value"
+											;;
+										esac
+									;;
+								esac
+							fi
+						done
+					else
+						# assume default section is correct
+						stdin_section="$section"
+						while read -r stdin_line
+						do
+							# parse section name
+							case "$stdin_line" in
+								\[*)
+									stdin_section="${stdin_line%%]*}"
+									stdin_section="${stdin_section##*[}"
+									continue
+								;;
+							esac
+							
+							# only handle of the current section, so if a section is defined, it must match the section were trying to set
+							[ "$stdin_section" = "$section" ] || continue
+							
+							case "$stdin_section" in
 								Interface)
-									case "$key" in
-										privatekey)
-											read -r interface_PrivateKey <<<"$value"
+									case "${stdin_line// /}" in
+										PrivateKey=*)
+											read -r interface_PrivateKey <<<"${stdin_line#*=}"
 										;;
-										address)
+										Address=*)
 											set_interface_Address=true
-											while read -d ',' -r stdin_subline
-											do
-												read -r stdin_subline <<<"$stdin_subline"
-												if [ -n "$stdin_subline" ]
-												then
-													new_interface_Address+=("$stdin_subline")
-												fi
-											done <<<"$value,"
+											split ',' "${stdin_line#*=}" new_interface_Address
 										;;
-										listenport)
-											read -r interface_ListenPort <<<"$value"
+										ListenPort=*)
+											read -r interface_ListenPort <<<"${stdin_line#*=}"
 										;;
-										serverendpoint)
-											read -r interface_ServerEndpoint <<<"$value"
+										Endpoint=*)
+											read -r interface_Endpoint <<<"${stdin_line#*=}"
 										;;
-										meshendpoint)
-											read -r interface_MeshEndpoint <<<"$value"
+										InterfaceID=*)
+											read -r interface_InterfaceID <<<"${stdin_line#*=}"
 										;;
-										interfaceid)
-											read -r interface_InterfaceID <<<"$value"
+										SubnetMask=*)
+											read -r interface_SubnetMask <<<"${stdin_line#*=}"
 										;;
-										subnetmask)
-											read -r interface_SubnetMask <<<"$value"
+										MasqueradeInterface=*)
+											read -r interface_MasqueradeInterface <<<"${stdin_line#*=}"
 										;;
 									esac
 								;;
 								Peer)
 									# note, PublicKey cannot be overwritten, since it's already used for matching
 									# if it is possible to change the PublicKey, then uniqueness of PublicKey's is not guaranteed
-									case "$key" in
-										type)
+									case "${stdin_line// /}" in
+										Type=*)
 											set_peer_Type=true
-											read -r new_peer_Type < <(strtolower "$value")
+											read -r new_peer_Type < <(strtolower "${stdin_line#*=}")
 										;;
-										endpoint)
+										Endpoint=*)
 											set_peer_Endpoint=true
-											read -r new_peer_Endpoint <<<"$value"
+											read -r new_peer_Endpoint <<<"${stdin_line#*=}"
 										;;
-										serverendpoint)
-											set_peer_ServerEndpoint=true
-											read -r new_peer_ServerEndpoint <<<"$value"
-										;;
-										meshendpoint)
-											set_peer_MeshEndpoint=true
-											read -r new_peer_MeshEndpoint <<<"$value"
-										;;
-										allowedips)
+										AllowedIPs=*)
 											set_peer_AllowedIPs=true
-											while read -d ',' -r stdin_subline
-											do
-												read -r stdin_subline <<<"$stdin_subline"
-												if [ -n "$stdin_subline" ]
-												then
-													new_peer_AllowedIPs+=("$stdin_subline")
-												fi
-											done <<<"$value,"
+											split ',' "${stdin_line#*=}" new_peer_AllowedIPs
 										;;
-										persistentkeepalive)
+										PersistentKeepalive=*)
 											set_peer_PersistentKeepalive=true
-											read -r new_peer_PersistentKeepalive <<<"$value"
+											read -r new_peer_PersistentKeepalive <<<"${stdin_line#*=}"
+										;;
+										Masquerade=*)
+											set_peer_Masquerade=true
+											read -r new_peer_Masquerade <<<"${stdin_line#*=}"
 										;;
 									esac
 								;;
 							esac
-						fi
-					done
-				else
-					# assume default section is correct
-					stdin_section="$section"
-					while read -r stdin_line
-					do
-						if [ -n "$stdin_line" ] && [ "${stdin_line:0:1}" = "[" ]
-						then
-							stdin_section="${stdin_line%%]*}"
-							stdin_section="${stdin_section##*[}"
-						fi
-						
-						# only handle of the current section, so if a section is defined, it must match the section were trying to set
-						[ "$stdin_section" = "$section" ] || continue
-						
-						case "$stdin_section" in
-							Interface)
-								case "${stdin_line// /}" in
-									PrivateKey=*)
-										read -r interface_PrivateKey <<<"${stdin_line#*=}"
-									;;
-									Address=*)
-										set_interface_Address=true
-										while read -d ',' -r stdin_subline
-										do
-											read -r stdin_subline <<<"$stdin_subline"
-											if [ -n "$stdin_subline" ]
-											then
-												new_interface_Address+=("$stdin_subline")
-											fi
-										done <<<"${stdin_line#*=},"
-									;;
-									ListenPort=*)
-										read -r interface_ListenPort <<<"${stdin_line#*=}"
-									;;
-									ServerEndpoint=*)
-										read -r interface_ServerEndpoint <<<"${stdin_line#*=}"
-									;;
-									MeshEndpoint=*)
-										read -r interface_MeshEndpoint <<<"${stdin_line#*=}"
-									;;
-									InterfaceID=*)
-										read -r interface_InterfaceID <<<"${stdin_line#*=}"
-									;;
-									SubnetMask=*)
-										read -r interface_SubnetMask <<<"${stdin_line#*=}"
-									;;
-								esac
-							;;
-							Peer)
-								# note, PublicKey cannot be overwritten, since it's already used for matching
-								# if it is possible to change the PublicKey, then uniqueness of PublicKey's is not guaranteed
-								case "${stdin_line// /}" in
-									Type=*)
-										set_peer_Type=true
-										read -r new_peer_Type < <(strtolower "${stdin_line#*=}")
-									;;
-									Endpoint=*)
-										set_peer_Endpoint=true
-										read -r new_peer_Endpoint <<<"${stdin_line#*=}"
-									;;
-									ServerEndpoint=*)
-										set_peer_ServerEndpoint=true
-										read -r new_peer_ServerEndpoint <<<"${stdin_line#*=}"
-									;;
-									MeshEndpoint=*)
-										set_peer_MeshEndpoint=true
-										read -r new_peer_MeshEndpoint <<<"${stdin_line#*=}"
-									;;
-									AllowedIPs=*)
-										set_peer_AllowedIPs=true
-										while read -d ',' -r stdin_subline
-										do
-											read -r stdin_subline <<<"$stdin_subline"
-											if [ -n "$stdin_subline" ]
-											then
-												new_peer_AllowedIPs+=("$stdin_subline")
-											fi
-										done <<<"${stdin_line#*=},"
-									;;
-									PersistentKeepalive=*)
-										set_peer_PersistentKeepalive=true
-										read -r new_peer_PersistentKeepalive <<<"${stdin_line#*=}"
-									;;
-								esac
-							;;
-						esac
-					done # READ FROM STDIN
-				fi
-				
-				# apply type from cli:
-				if ! $set_peer_Type
-				then
-					if [ "$opts_command" = "set-server" ]
-					then
-						set_peer_Type=true
-						new_peer_Type="server"
-					elif [ "$opts_command" = "set-client" ]
-					then
-						set_peer_Type=true
-						new_peer_Type="client"
-					fi
-				fi
-				
-				# apply new Interface entries
-				if $set_interface_Address
-				then
-					interface_Address=("${new_interface_Address[@]}")
-				fi
-				
-				# apply new Peer entries with certain restrictions
-				if $set_peer_Type && [ "$new_peer_Type" != "$peer_Type" ]
-				then
-					if [ "$new_peer_Type" = "client" ]
-					then
-						# remove Endpoints (a client cannot be reached externally per our definition)
-						peer_Endpoint=""
-						peer_ServerEndpoint=""
-						peer_MeshEndpoint=""
-						# remove any non-128-bitmask addresses
-						if ! $set_peer_AllowedIPs
-						then
-							set_peer_AllowedIPs=true
-							new_peer_AllowedIPs=()
-							for allowed_ip in "${peer_AllowedIPs[@]}"
-							do
-								allowed_ip="${allowed_ip%/128}"
-								case "$allowed_ip" in
-									*/*|*\$[1-9]*) ;; # skip non-128 bitmasks, and addresses with a non-zero cost
-									*)
-										new_peer_AllowedIPs+=("$allowed_ip/128")
-									;;
-								esac
-							done
-						fi
-						# remove persistent keepalive as well
-						peer_PersistentKeepalive=""
+						done # READ FROM STDIN
 					fi
 					
-					peer_Type="$new_peer_Type"
-				fi
-				if $set_peer_Endpoint
-				then
-					if [ "$peer_Type" = "client" ] && [ -n "$new_peer_Endpoint" ]
+					# apply new Interface entries
+					if $set_interface_Address
 					then
-						echo "warning: Endpoint not allowed for [Peer] Type = client." >&2
-					else
-						peer_Endpoint="$new_peer_Endpoint"
+						interface_Address=("${new_interface_Address[@]}")
+					fi
+					
+					# apply new Peer entries with certain restrictions
+					if $set_peer_Type && [ "$new_peer_Type" != "$peer_Type" ]
+					then
+						if [ "$new_peer_Type" = "client" ]
+						then
+							# remove Endpoints (a client cannot be reached externally per our definition)
+							peer_Endpoint=""
+							# remove any non-128-bitmask addresses
+							if ! $set_peer_AllowedIPs
+							then
+								set_peer_AllowedIPs=true
+								new_peer_AllowedIPs=()
+								for allowed_ip in "${peer_AllowedIPs[@]}"
+								do
+									allowed_ip="${allowed_ip%/128}"
+									case "$allowed_ip" in
+										*/*|*\$[1-9]*) ;; # skip non-128 bitmasks, and addresses with a non-zero cost
+										*)
+											new_peer_AllowedIPs+=("$allowed_ip/128")
+										;;
+									esac
+								done
+							fi
+							# remove persistent keepalive as well
+							peer_PersistentKeepalive=""
+						fi
+						
+						peer_Type="$new_peer_Type"
+					fi
+					if $set_peer_Endpoint
+					then
+						if [ "$peer_Type" = "client" ] && [ -n "$new_peer_Endpoint" ]
+						then
+							echo "warning: Endpoint not allowed for [Peer] Type = client." >&2
+						else
+							peer_Endpoint="$new_peer_Endpoint"
+						fi
+					fi
+					if $set_peer_AllowedIPs
+					then
+						peer_AllowedIPs=("${new_peer_AllowedIPs[@]}")
+					fi
+					if $set_peer_PersistentKeepalive
+					then
+						if [ "$peer_Type" = "client" ] && [ -n "$new_peer_PersistentKeepalive" ]
+						then
+							echo "warning: PersistentKeepalive not allowed for [Peer] Type = client."
+						else
+							peer_PersistentKeepalive="$new_peer_PersistentKeepalive"
+						fi
+					fi
+					if $set_peer_Masquerade
+					then
+						peer_Masquerade="$new_peer_Masquerade"
 					fi
 				fi
-				if $set_peer_ServerEndpoint
-				then
-					if [ "$peer_Type" = "client" ] && [ -n "$new_peer_ServerEndpoint" ]
-					then
-						echo "warning: Endpoint not allowed for [Peer] Type = client." >&2
-					else
-						peer_ServerEndpoint="$new_peer_ServerEndpoint"
-					fi
-				fi
-				if $set_peer_MeshEndpoint
-				then
-					if [ "$peer_Type" = "client" ] && [ -n "$new_peer_MeshEndpoint" ]
-					then
-						echo "warning: Endpoint not allowed for [Peer] Type = client." >&2
-					else
-						peer_MeshEndpoint="$new_peer_MeshEndpoint"
-					fi
-				fi
-				if $set_peer_AllowedIPs
-				then
-					peer_AllowedIPs=("${new_peer_AllowedIPs[@]}")
-				fi
-				if $set_peer_PersistentKeepalive
-				then
-					if [ "$peer_Type" = "client" ] && [ -n "$new_peer_PersistentKeepalive" ]
-					then
-						echo "warning: PersistentKeepalive not allowed for [Peer] Type = client."
-					else
-						peer_PersistentKeepalive="$new_peer_PersistentKeepalive"
-					fi
-				fi
-			fi
-			
-			print_section_buffer >&$write_fd
-		}
-		process_eof()
-		{
-			# if not matched, append new section at the end of the file
-			if ! $section_matched
-			then
-				case "$opts_command" in
-					set-interface) section="Interface" ;;
-					set-peer)
-						section="Peer"
-						peer_PublicKey="$1"
-					;;
-					set-client)
-						section="Peer"
-						peer_PublicKey="$1"
-						peer_Type="client"
-					;;
-					set-server)
-						section="Peer"
-						peer_PublicKey="$1"
-						peer_Type="server"
-					;;
-				esac
 				
-				process_section "$@"
-			fi
-		}
-		
-	elif [ "$opts_command" = "remove-peer" ]
-	then
-		process_section()
-		{
-			if [ "$section" = "Peer" ] && [ "$peer_PublicKey" = "$1" ]
-			then
-				return 0
-			else
 				print_section_buffer >&$write_fd
-			fi
-		}
-
-	elif [ "${opts_command:-show}" != "show" ]
-	then
-		echo "error: Invalid conf command ($opts_command)."
-		exit 1
-	fi
+			}
+			process_eof()
+			{
+				# if not matched, append new section at the end of the file
+				if ! $section_matched
+				then
+					case "$opts_command" in
+						set-interface)
+							section="Interface"
+						;;
+						set-peer)
+							section="Peer"
+							peer_PublicKey="$1"
+						;;
+					esac
+					
+					process_section "$@"
+				fi
+			}
+		;;
+		remove-peer)
+			process_section()
+			{
+				if [ "$section" = "Peer" ] && [ "$peer_PublicKey" = "$1" ]
+				then
+					return 0
+				else
+					print_section_buffer >&$write_fd
+				fi
+			}
+		;;
+		show|'') ;; # do default behavior, which is to print every section
+		*)
+			echo "error: Invalid conf command ($opts_command)."
+			exit 1
+		;;
+	esac
 	
 	# ensure existence of conf_file
 	(
@@ -1787,31 +1675,27 @@ then
 		
 		while read -r -u "$read_fd" original_line
 		do
-			# skip empty lines
-			if [ -z "$original_line" ]
-			then
-				continue
-			fi
-			
-			# skip comments, write where needed
-			if [ "${original_line:0:1}" = "#" ]
-			then
-				section_buffer+=("$original_line")
-				continue
-			fi
-			
-			# update section
-			if [ "${original_line:0:1}" = "[" ]
-			then
-				process_section "$@" || exitcode=$?
-				
-				reset_section_values
-				
-				section="${original_line%%]*}"
-				section="${section##*[}"
-				
-				continue
-			fi
+			case "$original_line" in
+				'')
+					# skip empty lines
+					continue
+				;;
+				\#*)
+					# skip comments
+					section_buffer+=("$original_line")
+					continue
+				;;
+				\[*)
+					process_section "$@" || exitcode=$?
+					
+					reset_section_values
+					
+					section="${original_line%%]*}"
+					section="${section##*[}"
+					
+					continue
+				;;
+			esac
 			
 			# strip comments at end of lines
 			line="${original_line%%#*}"
@@ -1827,26 +1711,15 @@ then
 						;;
 						Address=*)
 							parsed=true
-							while read -d ',' -r subline
-							do
-								read -r subline <<<"$subline"
-								if [ -n "$subline" ]
-								then
-									interface_Address+=("$subline")
-								fi
-							done <<<"${line#*=},"
+							split ',' "${line#*=}" interface_Address
 						;;
 						ListenPort=*)
 							parsed=true
 							read -r interface_ListenPort <<<"${line#*=}"
 						;;
-						ServerEndpoint=*)
+						Endpoint=*)
 							parsed=true
-							read -r interface_ServerEndpoint <<<"${line#*=}"
-						;;
-						MeshEndpoint=*)
-							parsed=true
-							read -r interface_MeshEndpoint <<<"${line#*=}"
+							read -r interface_Endpoint <<<"${line#*=}"
 						;;
 						InterfaceID=*)
 							parsed=true
@@ -1855,6 +1728,10 @@ then
 						SubnetMask=*)
 							parsed=true
 							read -r interface_SubnetMask <<<"${line#*=}"
+						;;
+						MasqueradeInterface=*)
+							parsed=true
+							read -r interface_MasqueradeInterface <<<"${line#*=}"
 						;;
 					esac
 				;;
@@ -1872,28 +1749,17 @@ then
 							parsed=true
 							read -r peer_Endpoint <<<"${line#*=}"
 						;;
-						ServerEndpoint=*)
-							parsed=true
-							read -r peer_ServerEndpoint <<<"${line#*=}"
-						;;
-						MeshEndpoint=*)
-							parsed=true
-							read -r peer_MeshEndpoint <<<"${line#*=}"
-						;;
 						AllowedIPs=*)
 							parsed=true
-							while read -d ',' -r subline
-							do
-								read -r subline <<<"$subline"
-								if [ -n "$subline" ]
-								then
-									peer_AllowedIPs+=("$subline")
-								fi
-							done <<<"${line#*=},"
+							split ',' "${line#*=}" peer_AllowedIPs
 						;;
 						PersistentKeepalive=*)
 							parsed=true
 							read -r peer_PersistentKeepalive <<<"${line#*=}"
+						;;
+						Masquerade=*)
+							parsed=true
+							read -r peer_Masquerade <<<"${line#*=}"
 						;;
 					esac
 				;;
@@ -1923,9 +1789,14 @@ then
 		exit $exitcode
 		
 	) 200<"$conf_file" || exit $?
+}
 
-elif [ "$opts_context" = "client" ]
-then
+
+context_client()
+{
+	opts_command="$1"
+	shift
+	
 	conf_file="/etc/wireguard/$opts_interface.conf"
 	
 	read -r local_PrivateKey < <("$0" -i "$opts_interface" conf get-interface PrivateKey)
@@ -1934,299 +1805,331 @@ then
 	if [ -z "$local_PrivateKey" ]
 	then
 		echo "info: Generating private key..."
-		read -r local_PrivateKey < <("$0" wg genkey)
+		read -r local_PrivateKey < <("$0" genkey)
 		
 		if [ -z "$local_PrivateKey" ]
 		then
-			echo "error: Failed to generate a private key ($0 wg genkey)."
+			echo "error: Failed to generate a private key ($0 genkey)."
 			exit 1
 		fi
 		
 		echo "info: Missing private key generated."
 		
+		# note: pass through stdin, to avoid leaking PrivateKey in process list
 		"$0" -i "$opts_interface" conf set-interface <<EOF
 PrivateKey = $local_PrivateKey
 EOF
 	fi
 	
-	read -r local_PublicKey < <("$0" wg pubkey <<<"$local_PrivateKey")
+	read -r local_PublicKey < <("$0" pubkey <<<"$local_PrivateKey")
 	
-	if [ "$opts_command" = "connect" ]
-	then
-		connect_host="$1"
-		connect_port="${2:-$WIREGUARD_PORT}"
-		
-		if [ -n "$opts_mac_address" ] && [ "$opts_mac_address" != "auto" ]
-		then
-			# set a custom InterfaceID, as per command-line options (it must be hexadecimal)
+	case "$opts_command" in
+		connect)
+			connect_host="$1"
+			connect_port="$2"
 			
-			local_InterfaceId="$opts_mac_address"
-			
-		else
-			# try to read from cache
-			read -r local_InterfaceID _ < <("$0" -i "$opts_interface" conf get-interface InterfaceID) || true
-			
-			# automatically determine MAC-address based on available network links
-			if [ -z "$local_InterfaceID" ]
+			# support for both host:port and host port in one combined argument or two separate arguments
+			if [ -z "$connect_port" ]
 			then
-				# try the first default route
-				read -r _ _ _ _ default_dev _ < <(ip route show default) # parse: _default _via _address _dev <default_dev> _...
-				[ -z "$default_dev" ] || read -r local_InterfaceID _ < <(cat /sys/class/net/"$default_dev"/address 2>/dev/null) || true
-				
-				# then try any available link
-				[ -n "$local_InterfaceID" ] || read -r local_InterfaceID _ < <(cat /sys/class/net/*/address 2>/dev/null) || true
-				
-				# cache this automatically determined MAC-address for consistent re-use in the future (in case network link is unplugged next reconnect)
-				if [ -n "$local_InterfaceID" ]
-				then
-					if "$0" -i "$opts_interface" conf set-interface <<EOF
-InterfaceID = $local_InterfaceID
-EOF
-					then
-						echo "info: InterfaceID ($local_InterfaceID) saved to configuration file."
-					else
-						echo "warning: Failed to save InterfaceID."
-					fi
-				else
-					echo "error: Failed to "
-				fi
+				# extract port from host (with IPv6 detection)
+				case "$connect_host" in
+					\[*\]:*)
+						connect_port="${connect_host##*:}"
+						connect_host="${connect_host%:*}"
+					;;
+					*:*:*)
+						# IPv6 address without port
+					;;
+					*:*)
+						connect_port="${connect_host##*:}"
+						connect_host="${connect_host%:*}"
+					;;
+				esac
 			fi
-		fi
-		
-		echo "info: Connecting to $connect_host:$connect_port..."
-		
-		# resolve connect_host to a single IPv4/IPv6 address (if getent ahostsv6, use awk '$2=="STREAM"{print $1; exit}')
-		read -r connect_host _ < <(getent hosts "$connect_host")
-		
-		# if IPv6, wrap IPv6 in square brackets, unless it is already wrapped
-		read -r connect_host < <(ensure_ipv6_brackets "$connect_host")
-		
-		echo "info: Connecting to resolved address: $connect_host:$connect_port..."
-		echo "info: Local public key: $local_PublicKey"
-		
-		remote_PublicKey=""
-		remote_ListenPort=""
-		remote_Address=()
-		remote_MeshEndpoint=""
-		
-		client_Address=""
-		
-		section=""
-		while read -r line || { socat_exit_code="$line" && break; }
-		do
-			sock_receive "$line"
-			
-			if [ -n "$line" ] && [ "${line:0:1}" = "[" ]
+			if [ -z "$connect_port" ]
 			then
+				connect_port="$WIREGUARD_PORT"
+			fi
+			
+			# if IPv6, wrap IPv6 in square brackets, unless it is already wrapped
+			read -r connect_host < <(ensure_ipv6_brackets "$connect_host")
+			
+			if [ -n "$opts_mac_address" ] && [ "$opts_mac_address" != "auto" ]
+			then
+				# set a custom InterfaceID, as per command-line options (it must be hexadecimal)
 				
-				section="${line%%]*}]"
+				local_InterfaceId="$opts_mac_address"
 				
 			else
-				case "${line// /}" in
-					\#\[server\]:*)
-						# Received server message formatted as a special comment (might be a warning or error): # [server]: <message>
-						echo "server:${line#*:}"
+				# try to read from cache
+				read -r local_InterfaceID _ < <("$0" -i "$opts_interface" conf get-interface InterfaceID) || true
+				
+				# automatically determine MAC-address based on available network links
+				if [ -z "$local_InterfaceID" ]
+				then
+					# try the first default route
+					read -r _ _ _ _ default_dev _ < <(ip route show default) # parse: _default _via _address _dev <default_dev> _...
+					[ -z "$default_dev" ] || read -r local_InterfaceID _ < <(cat /sys/class/net/"$default_dev"/address 2>/dev/null) || true
+					
+					# then try any available link
+					[ -n "$local_InterfaceID" ] || read -r local_InterfaceID _ < <(cat /sys/class/net/*/address 2>/dev/null) || true
+					
+					# cache this automatically determined MAC-address for consistent re-use in the future (in case network link is unplugged next reconnect)
+					if [ -n "$local_InterfaceID" ]
+					then
+						if "$0" -i "$opts_interface" conf set-interface <<EOF
+InterfaceID = $local_InterfaceID
+EOF
+						then
+							echo "info: InterfaceID ($local_InterfaceID) saved to configuration file."
+						else
+							echo "warning: Failed to save InterfaceID."
+						fi
+					else
+						echo "error: Failed to "
+					fi
+				fi
+			fi
+			
+			echo "info: Connecting to: $connect_host:$connect_port..."
+			echo "info: Local public key: $local_PublicKey"
+			
+			remote_PublicKey=""
+			remote_ListenPort=""
+			remote_Address=()
+			remote_Endpoint=""
+			
+			client_Address=""
+			client_Masquerade=()
+			
+			conn_cmd=(socat -t20 - tcp:"$connect_host":"$connect_port")
+			if is_http "$connect_host" "$connect_port"
+			then
+				conn_cmd=(curl --data-binary @- --insecure --max-time 20 -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:$connect_port/.well-known/wg-autoconf/")
+			fi
+			
+			section=""
+			while read -r line || { socat_exit_code="$line" && break; }
+			do
+				sock_receive "$line"
+				
+				# parse section name
+				case "$line" in
+					\[*)
+						section="${line%%]*}"
+						section="${section##*[}"
+						continue
 					;;
+				esac
+				
+				# parse section body
+				case "${line// /}" in
 					Error=*)
 						read -r remote_err <<<"${line#*=}"
 						echo "error: Server responded with error: $remote_err"
 						exit 1
 					;;
 				esac
-				
 				case "$section" in
-					\[Interface\])
+					Interface)
 						case "${line// /}" in
 							PublicKey=*)
 								read -r remote_PublicKey <<<"${line#*=}"
 							;;
 							Address=*)
-								while read -d ',' -r subline
-								do
-									read -r subline <<<"$subline"
-									if [ -n "$subline" ]
-									then
-										remote_Address+=("$subline")
-									fi
-								done <<<"${line#*=},"
+								split ',' "${line#*=}" remote_Address
 							;;
 							ListenPort=*)
 								read -r remote_ListenPort <<<"${line#*=}"
 							;;
-							MeshEndpoint=*)
-								read -r remote_MeshEndpoint <<<"${line#*=}"
+							Endpoint=*)
+								read -r remote_Endpoint <<<"${line#*=}"
 							;;
 						esac
 					;;
-					\[Peer\])
+					Peer)
 						case "${line// /}" in
 							AllowedIPs=*)
 								read -r client_Address <<<"${line#*=}"
 							;;
+							Masquerade=*)
+								# the IP-addresses that the client is allowed to masquerade, by default the server configures the client, unless the client uses --no-masquerade with connect
+								split ',' "${line#*=}" client_Masquerade
+							;;
 						esac
 					;;
 				esac
-			fi
-		done < <(
-			socat -t20 - tcp:"$connect_host":"$connect_port" < <(
-				sock_send "[Peer]"
-				sock_send "Type = client"
-				sock_send "PublicKey = $local_PublicKey"
-				[ -z "$local_InterfaceID" ] || sock_send "InterfaceID = $local_InterfaceID"
-				sock_send ""
+			done < <("${conn_cmd[@]}" < <(
+					sock_send "[Peer]"
+					sock_send "Type = client"
+					sock_send "PublicKey = $local_PublicKey"
+					[ -z "$local_InterfaceID" ] || sock_send "InterfaceID = $local_InterfaceID"
+					sock_send ""
+				)
+				echo -n "$?"
 			)
-			echo -n "$?"
-		)
-		
-		if [ "$socat_exit_code" -ne 0 ]
-		then
-			echo "error: Connection failure ($socat_exit_code)."
-			exit 1
-		fi
-		
-		if [ -z "$client_Address" ]
-		then
-			echo "error: Did not receive AllowedIPs from server. Is the client ($local_PublicKey) authorized?"
-			echo "note: The server may authorize this client using: wg-autoconf server allow '$local_PublicKey'"
-			exit 1
-		fi
-		
-		# fix ListenPort
-		[ -z "$remote_ListenPort" ] || remote_ListenPort="$connect_port"
-		
-		# resolve Endpoint from MeshEndpoint if possible
-		remote_Endpoint="$connect_host:$remote_ListenPort"
-		
-		# fix MeshEndpoint to be complete with ListenPort
-		if [ -n "$remote_MeshEndpoint" ]
-		then
-			# add missing square brackets to a loose IPv6 address (without port)
-			read -r remote_MeshEndpoint < <(ensure_ipv6_brackets "$remote_MeshEndpoint")
 			
-			# add missing port argument
-			case "$remote_MeshEndpoint" in
-				\[*\]) # is ipv6-address
-					remote_MeshEndpoint="$remote_MeshEndpoint:$remote_ListenPort"
-				;;
-				*:*) ;; # is host:port definition
-				*)
-					remote_MeshEndpoint="$remote_MeshEndpoint:$remote_ListenPort"
-				;;
-			esac
+			if [ "$socat_exit_code" -ne 0 ]
+			then
+				echo "error: Connection failure ($socat_exit_code)."
+				exit 1
+			fi
 			
-			# if remote_ServerEndpoint is given, try to resolve it, and overwrite connect_host with the endpoint host
-			case "$remote_MeshEndpoint" in
-				\[*\]:*)
-					# IPv6 address with port
-					remote_Endpoint="$remote_MeshEndpoint"
-				;;
-				[0-9].[0-9].[0-9].[0-9]:*)
-					# IPv4 address with port
-					remote_Endpoint="$remote_MeshEndpoint"
-				;;
-				*:*)
-					# hostname with or without port
-					read -r resolved_Endpoint _ < <(getent hosts "${remote_MeshEndpoint%:*}") || true
-					[ -z "$resolved_Endpoint" ] || remote_Endpoint="$resolved_Endpoint"
-					read -r remote_Endpoint < <(ensure_ipv6_brackets "$remote_Endpoint")
-					remote_Endpoint="$remote_Endpoint:$remote_ListenPort"
-				;;
-			esac
-		fi
-		
-		# combine server_Address to one line:
-		read -r remote_AddressLine < <(IFS=','; echo "${remote_Address[*]}")
-		remote_AddressLine="${remote_AddressLine//,/, }"
-		
-		echo "info: Configuration received."
-		echo "info: Client address: $client_Address"
-		echo "info: Server public key: $remote_PublicKey"
-		[ -n "$remote_AddressLine" ] && echo "info: Server WireGuard address: $remote_AddressLine"
-		echo "info: Server WireGuard port: $remote_ListenPort"
-		
-		"$0" -i "$opts_interface" conf set-interface <<EOF
+			if [ -z "$client_Address" ]
+			then
+				echo "error: Did not receive AllowedIPs from server. Is the client ($local_PublicKey) authorized?"
+				echo "note: The server may authorize this client using: wg-autoconf server allow '$local_PublicKey'"
+				exit 1
+			fi
+			
+			# fix ListenPort
+			[ -z "$remote_ListenPort" ] || remote_ListenPort="$connect_port"
+			
+			# fix Endpoint to be complete with ListenPort
+			if [ -n "$remote_Endpoint" ]
+			then
+				# add missing square brackets to a loose IPv6 address (without port)
+				read -r remote_Endpoint < <(ensure_ipv6_brackets "$remote_Endpoint")
+				
+				# add missing port argument
+				case "$remote_Endpoint" in
+					\[*\]) # is ipv6-address
+						remote_Endpoint="$remote_Endpoint:$remote_ListenPort"
+					;;
+					*:*) ;; # is host:port definition
+					*)
+						remote_Endpoint="$remote_Endpoint:$remote_ListenPort"
+					;;
+				esac
+				
+				# override Endpoint with the server settings
+				remote_Endpoint="$remote_Endpoint"
+			else
+				# set to same hostname as used to connect, and add port explicitly
+				remote_Endpoint="$connect_host:$remote_ListenPort"
+			fi
+			
+			# combine remote_Address to one line:
+			read -r remote_AddressLine < <(join ', ' "${remote_Address[@]}")
+			
+			# combine client_Masquerade to one line:
+			read -r client_MasqueradeLine < <(join ', ' "${client_Masquerade[@]}")
+			
+			echo "info: Configuration received from server ($remote_PublicKey)."
+			
+			echo "info: Client address: $client_Address"
+			
+			[ -z "$remote_AddressLine" ] || echo "info: Server virtual addresses: $remote_AddressLine"
+			
+			echo "info: Server is reachable at: $remote_Endpoint"
+			
+			[ -z "$client_MasqueradeLine" ] || echo "info: Server allows Masquerade for the following IP's: $client_MasqueradeLine"
+			
+			# if a client wants to enable routing all internet, they just need to set AllowedIPs of that server to: 0.0.0.0/0, ::/0, the server will set MASQUERADE if the server allows it
+			# a client can only reject this option to masquerade traffic, by passing --no-masquerade
+			if $opts_no_masquerade || [ -z "$client_MasqueradeLine" ]
+			then
+				server_AllowedIPs="$remote_AddressLine"
+			else
+				read -r server_AllowedIPs < <(join ', ' "${remote_Address[@]}" "${client_Masquerade}")
+			fi
+			
+			if ! "$0" -i "$opts_interface" conf set-interface <<EOF
 Address = $client_Address
 EOF
-		"$0" -i "$opts_interface" conf set-server "$remote_PublicKey" <<EOF
-AllowedIPs = $remote_AddressLine
+			then
+				echo "error: Failed to update configuration (set-interface)."
+				exit 1
+			fi
+			if ! "$0" -i "$opts_interface" conf set-peer "$remote_PublicKey" <<EOF
+Type = server
+AllowedIPs = $server_AllowedIPs
 Endpoint = $remote_Endpoint
 PersistentKeepalive = $opts_persistent_keepalive_s
-MeshEndpoint = $remote_MeshEndpoint
 EOF
-		
-		"$0" wg up "$opts_interface"
-	else
-		echo "error: Invalid client command ($opts_command)." >&2
-		exit 1
-	fi
+			then
+				echo "error: Failed to update configuration (set-peer)."
+				exit 1
+			fi
+			
+			"$0" up "$opts_interface"
+		;;
+		*)
+			echo "error: Invalid client command ($opts_command)." >&2
+			exit 1
+		;;
+	esac
+}
 
-elif [ "$opts_context" = "server" ]
-then
+
+context_server()
+{
+	opts_command="$1"
+	shift
 	
-	
-	if [ "$opts_command" = "allow" ]
-	then
-		if ! "$0" -i "$opts_interface" conf set-peer "$@"
-		then
-			echo "error: Failed to allow peer (conf $conf_cmd)."
-			exit 1
-		fi
-		
-		if ! "$0" wg update "$opts_interface"
-		then
-			echo "error: Failed to allow peer (wg update)."
-			exit 1
-		fi
-		
-		echo "info: Peer is now allowed access."
-		exit 0
-	fi
-	
-	
-	if [ "$opts_command" = "deny" ]
-	then
-		if ! "$0" -i "$opts_interface" conf remove-peer "$@"
-		then
-			echo "error: Failed to deny peer (conf remove-peer)."
-			exit 1
-		fi
-		
-		if ! "$0" wg update "$opts_interface"
-		then
-			echo "error: Failed to deny peer (wg update)."
-			exit 1
-		fi
-		
-		echo "info: Peer is now denied access."
-		exit 0
-	fi
+	case "$opts_command" in
+		allow)
+			if ! "$0" -i "$opts_interface" conf set-peer "$@"
+			then
+				echo "error: Failed to allow peer (conf $conf_cmd)."
+				exit 1
+			fi
+			
+			if ! "$0" update "$opts_interface"
+			then
+				echo "error: Failed to allow peer (update)."
+				exit 1
+			fi
+			
+			echo "info: Peer is now allowed access."
+			exit 0
+		;;
+		deny)
+			if ! "$0" -i "$opts_interface" conf remove-peer "$@"
+			then
+				echo "error: Failed to deny peer (conf remove-peer)."
+				exit 1
+			fi
+			
+			if ! "$0" update "$opts_interface"
+			then
+				echo "error: Failed to deny peer (update)."
+				exit 1
+			fi
+			
+			echo "info: Peer is now denied access."
+			exit 0
+		;;
+	esac
 	
 	
 	# grab local_PrivateKey
 	local_PrivateKey="$("$0" -i "$opts_interface" conf get-interface PrivateKey)"
 	
+	
 	# generate new PrivateKey if missing
 	if [ -z "$local_PrivateKey" ]
 	then
 		echo "info: Generating private key..."
-		local_PrivateKey="$("$0" wg genkey)"
+		local_PrivateKey="$("$0" genkey)"
 		
 		if [ -z "$local_PrivateKey" ]
 		then
-			echo "error: Failed to generate a private key ($0 wg genkey)."
+			echo "error: Failed to generate a private key ($0 genkey)."
 			exit 1
 		fi
 		
 		echo "info: Missing private key generated."
 		
+		# note: pass through stdin to avoid leaking PrivateKey in the process list
 		"$0" -i "$opts_interface" conf set-interface <<EOF
 PrivateKey = $local_PrivateKey
 EOF
 	fi
 	
 	
-	# grab local_PublicKey (generate from private key)
-	local_PublicKey="$("$0" wg pubkey <<<"$local_PrivateKey")"
+	# grab local_PublicKey (extract from private key)
+	local_PublicKey="$("$0" pubkey <<<"$local_PrivateKey")"
 	
 	
 	# grab local_Address value and generate local_AddressLine
@@ -2242,14 +2145,7 @@ EOF
 	then
 		local_AddressLine="${opts_vpn_address:-$DEFAULT_VPN_ADDRESS}"
 		local_Address=()
-		while read -d ',' -r addr
-		do
-			read -r addr <<<"$addr"
-			if [ -n "$addr" ]
-			then
-				local_Address+=("$addr")
-			fi
-		done <<<"${local_AddressLine#*=},"
+		split ',' "${local_AddressLine#*=}" local_Address
 		
 		echo "info: Updating Address in Interface-section."
 		
@@ -2257,807 +2153,997 @@ EOF
 Address = $local_AddressLine
 EOF
 	else
-		read -r local_AddressLine < <(IFS=','; echo "${local_Address[*]}")
-		local_AddressLine="${local_AddressLine//,/, }"
+		read -r local_AddressLine < <(join ',' "${local_Address[@]}")
 	fi
 	
 	
 	# grab local_ListenPort (and set local_ListenPort_configured)
 	read -r local_ListenPort < <("$0" -i "$opts_interface" conf get-interface ListenPort)
 	[ -n "$local_ListenPort" ] && local_ListenPort_configured=true || local_ListenPort_configured=false
-	[ -n "$local_ListenPort" ] || read -r local_ListenPort < <("$0" wg show "$opts_interface" listen-port)
+	[ -n "$local_ListenPort" ] || read -r local_ListenPort < <("$0" show "$opts_interface" listen-port)
 	[ -n "$local_ListenPort" ] || local_ListenPort="$WIREGUARD_PORT"
 	
 	
-	# grab local_ServerEndpoint
-	read -r local_ServerEndpoint < <("$0" -i "$opts_interface" conf get-interface ServerEndpoint)
+	# grab local_Endpoint
+	read -r local_Endpoint < <("$0" -i "$opts_interface" conf get-interface Endpoint)
+	
 	
 	# fallback to current hostname (this is probably the best default behavior that should not be stored in the configuration file explicitly unless done so manually)
-	[ -n "$local_ServerEndpoint" ] || read -r local_ServerEndpoint < <(hostname)
+	[ -n "$local_Endpoint" ] || read -r local_Endpoint < <(hostname)
 	
-	if [ "$opts_command" = "connect" ]
-	then
-		connect_host="$1"
-		connect_port="${2:-$WIREGUARD_PORT}"
-		
-		echo "info: Connecting to $connect_host:$connect_port..."
-		
-		# resolve connect_host to a single IPv4/IPv6 address (if getent ahostsv6, use awk '$2=="STREAM"{print $1; exit}')
-		read -r connect_host _ < <(getent hosts "$connect_host")
-		
-		# if IPv6, wrap IPv6 in square brackets, unless it is already wrapped
-		read -r connect_host < <(ensure_ipv6_brackets "$connect_host")
-		
-		echo "info: Connecting to resolved address: $connect_host:$connect_port..."
-		
-		# determine local address prefixed subnet mask
-		local_Address=()
-		while read -r address
-		do
-			local_Address+=("$address")
+	
+	case "$opts_command" in
+		connect)
+			connect_host="$1"
+			connect_port="${2:-$WIREGUARD_PORT}"
 			
-		done < <("$0" -i "$opts_interface" conf get-interface Address)
-		
-		# add AllowedIPs from servers open for relay to local_Address, but with an increased cost
-		
-		# one IP per line, multiple lines may belong to one peer
-		while read -r address
-		do
-			[ -n "$address" ] || continue
+			echo "info: Connecting to $connect_host:$connect_port..."
 			
-			# AllowedIPs may contain cost ($), apply the cost as a metric to the ip -6 route
-			relay_cost="0"
-			case "$address" in
-				*\$*)
-					relay_ip="${address%\$*}"
-					relay_cost="${address#*\$}"
-					[ -n "$relay_cost" ] || relay_cost="0"
-				;;
-			esac
-			# increase relay cost for once, since this is a server
-			relay_cost="$((relay_cost + 1))"
+			# resolve connect_host to a single IPv4/IPv6 address (if getent ahostsv6, use awk '$2=="STREAM"{print $1; exit}')
+			read -r connect_host _ < <(getent hosts "$connect_host")
 			
-			local_Address+=("${address%\$*}\$$relay_cost")
+			# if IPv6, wrap IPv6 in square brackets, unless it is already wrapped
+			read -r connect_host < <(ensure_ipv6_brackets "$connect_host")
 			
-		done < <("$0" -i "$opts_interface" conf list-servers AllowedIPs)
-		
-		read -r local_AddressLine < <(IFS=','; echo "${local_Address[*]}")
-		local_AddressLine="${local_AddressLine//,/, }"
-		
-		# fallback to opts
-		if [ -z "$local_Address" ]
-		then
-			local_Address=("$opts_vpn_address")
-		fi
-		
-		# if ServerEndpoint is set, add port to it, because it is mandatory to have a port in the [Peer]-section that we'll send
-		if [ -n "$local_ServerEndpoint" ]
-		then
-			# add missing square brackets to a loose IPv6 address (without port)
-			read -r local_ServerEndpoint < <(ensure_ipv6_brackets "$local_ServerEndpoint")
+			echo "info: Connecting to resolved address: $connect_host:$connect_port..."
 			
-			# add missing port argument (an Endpoint and ServerEndpoint in [Peer] must have a port, however, in the [Interface]-section it should be left out, since ListenPort must be set to the same port anyway)
-			case "$local_ServerEndpoint" in
-				\[*\]) # is ipv6-address
-					local_ServerEndpoint="$local_ServerEndpoint:$local_ListenPort"
-				;;
-				*:*) ;; # is host:port definition
-				*)
-					local_ServerEndpoint="$local_ServerEndpoint:$local_ListenPort"
-				;;
-			esac
-		fi
-		
-		# give PublicKey, telling how to securely connect with us
-		# give Endpoint, telling how to reach us
-		# give Address, telling which IP-address ranges we are responsible for (using a subnet mask), including metric cost for each relay
-		
-		remote_PublicKey=""
-		remote_Address=()
-		remote_ListenPort=""
-		remote_ServerEndpoint=""
-		
-		assigned_Address=()
-		
-		echo "Going to send section to remote server:"
-		echo "[Peer]"
-		echo "Type = Server"
-		echo "PublicKey = $local_PublicKey"
-		echo "Address = $local_AddressLine"
-		echo "ServerEndpoint = $local_ServerEndpoint"
-		echo ""
-		
-		echo "Receiving from remote server:"
-		section=""
-		while read -r line || { socat_exit_code="$line" && break; }
-		do
-			sock_receive "$line"
+			# determine local address prefixed subnet mask
+			local_Address=()
+			while read -r address
+			do
+				local_Address+=("$address")
+				
+			done < <("$0" -i "$opts_interface" conf get-interface Address)
 			
-			if [ -n "$line" ] && [ "${line:0:1}" = "[" ]
+			# add AllowedIPs from servers open for relay to local_Address, but with an increased cost
+			
+			# one IP per line, multiple lines may belong to one peer
+			while read -r address
+			do
+				[ -n "$address" ] || continue
+				
+				# AllowedIPs may contain cost ($), apply the cost as a metric to the ip -6 route
+				relay_cost="0"
+				case "$address" in
+					*\$*)
+						relay_ip="${address%\$*}"
+						relay_cost="${address#*\$}"
+						[ -n "$relay_cost" ] || relay_cost="0"
+					;;
+				esac
+				# increase relay cost for once, since this is a server
+				relay_cost="$((relay_cost + 1))"
+				
+				local_Address+=("${address%\$*}\$$relay_cost")
+				
+			done < <("$0" -i "$opts_interface" conf list-servers AllowedIPs)
+			
+			read -r local_AddressLine < <(join ', ' "${local_Address[@]}")
+			
+			# fallback to opts
+			[ "${#local_Address[@]}" -ne 0 ] || local_Address=("$opts_vpn_address")
+			
+			# if Endpoint is set, add port to it, because it is mandatory to have a port in the [Peer]-section that we'll send
+			if [ -n "$local_Endpoint" ]
 			then
-				section="${line%%]*}]"
-			else
+				# add missing square brackets to a loose IPv6 address (without port)
+				read -r local_Endpoint < <(ensure_ipv6_brackets "$local_Endpoint")
+				
+				# add missing port argument (an Endpoint and ServerEndpoint in [Peer] must have a port, however, in the [Interface]-section it should be left out, since ListenPort must be set to the same port anyway)
+				case "$local_Endpoint" in
+					\[*\]) # is ipv6-address
+						local_Endpoint="$local_Endpoint:$local_ListenPort"
+					;;
+					*:*) ;; # is host:port definition
+					*)
+						local_Endpoint="$local_Endpoint:$local_ListenPort"
+					;;
+				esac
+			fi
+			
+			# give PublicKey, telling how to securely connect with us
+			# give Endpoint, telling how to reach us
+			# give Address, telling which IP-address ranges we are responsible for (using a subnet mask), including metric cost for each relay
+			
+			remote_PublicKey=""
+			remote_Address=()
+			remote_ListenPort=""
+			remote_Endpoint=""
+			
+			assigned_Address=()
+			
+			conn_cmd=(socat -t20 - tcp:"$connect_host":"$connect_port")
+			if is_http "$connect_host" "$connect_port"
+			then
+				conn_cmd=(curl --data-binary @- --insecure --max-time 20 -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:$connect_port/.well-known/wg-autoconf/")
+			fi
+			
+			section=""
+			while read -r line || { socat_exit_code="$line" && break; }
+			do
+				sock_receive "$line"
+				
+				# parse section name
+				case "$line" in
+					\[*)
+						section="${line%%]*}"
+						section="${section##*[}"
+						continue
+					;;
+				esac
+				
+				# parse section body
+				case "${line// /}" in
+					Error=*)
+						read -r remote_err <<<"${line#*=}"
+						echo "error: Server responded with error: $remote_err"
+						exit 1
+					;;
+				esac
 				case "$section" in
-					\[Interface\])
+					Interface)
 						case "${line// /}" in
-							\#\[server\]:*)
-								# Received server message formatted as a special comment (might be a warning or error): # [server]: <message>
-								echo "server:${line#*:}"
-							;;
 							PublicKey=*)
 								read -r remote_PublicKey <<<"${line#*=}"
 							;;
 							Address=*)
-								while read -d ',' -r subline
-								do
-									read -r subline <<<"$subline"
-									if [ -n "$subline" ]
-									then
-										remote_Address+=("$subline")
-									fi
-								done <<<"${line#*=},"
+								split ',' "${line#*=}" remote_Address
 							;;
 							ListenPort=*)
 								read -r remote_ListenPort <<<"${line#*=}"
 							;;
-							ServerEndpoint=*)
-								read -r remote_ServerEndpoint <<<"${line#*=}"
+							Endpoint=*)
+								read -r remote_Endpoint <<<"${line#*=}"
 							;;
 						esac
 					;;
-					\[Peer\])
+					Peer)
 						case "${line// /}" in
-							\#\[server\]:*)
-								# Received server message formatted as a special comment (might be a warning or error): # [server]: <message>
-								echo "server:${line#*:}"
-							;;
 							AllowedIPs=*)
 								split ',' "${line#*=}" assigned_Address
-								while read -d ',' -r subline
-								do
-									read -r subline <<<"$subline"
-									[ -n "$subline" ] || continue
-									
-									assigned_Address+=("$subline")
-									
-								done <<<"${line#*=},"
 							;;
 						esac
 					;;
 				esac
+				
+			done < <("${conn_cmd[@]}" < <(
+					
+					sock_send "[Peer]"
+					sock_send "Type = Server"
+					sock_send "PublicKey = $local_PublicKey"
+					sock_send "Address = $local_AddressLine"
+					sock_send "Endpoint = $local_Endpoint"
+					sock_send ""
+				); echo -n "$?")
+			
+			if [ "$socat_exit_code" -ne 0 ]
+			then
+				echo "error: Connection failure ($socat_exit_code)."
+				exit 1
 			fi
-		done < <(socat -t20 - tcp:"$connect_host":"$connect_port" < <(
-				sock_send "[Peer]"
-				sock_send "Type = Server"
-				sock_send "PublicKey = $local_PublicKey"
-				sock_send "Address = $local_AddressLine"
-				sock_send "ServerEndpoint = $local_ServerEndpoint"
-				sock_send ""
-			); echo -n "$?")
-		
-		echo "END of received lines from remote server."
-		
-		if [ "$socat_exit_code" -ne 0 ]
-		then
-			echo "error: Connection failure ($socat_exit_code)."
-			exit 1
-		fi
-		
-		assigned_PrimaryAddress="${assigned_Address[0]}"
-		assigned_PrimaryAddress="${assigned_PrimaryAddress%/*}/128"
-		
-		# combine server_Address to one line:
-		read -r assigned_AddressLine < <(join ',' "${assigned_Address[@]}")
-		assigned_AddressLine="${assigned_AddressLine//,/, }"
-		
-		if [ -z "$assigned_AddressLine" ]
-		then
-			echo "error: Did not receive AllowedIPs from remote server. Is the local server ($local_PublicKey) authorized?"
-			echo "note: The remote server may authorize this local server using: $0 wg server allow '$local_PublicKey' <<<'Type=server'"
-			exit 1
-		fi
-		
-		# filter our own local address from remote address, as it might be contained by remote address since it could be a relay for us
-		# this would create a loop, so that is avoided here
-		filtered_remote_Address=()
-		while read -r address
-		do
-			filtered_remote_Address+=("$address")
 			
-		done < <(grep -Fvxf <(join $'\n' "${local_Address[@]}") <(join $'\n' "${remote_Address[@]}"))
-		remote_Address=("${filtered_remote_Address[@]}")
-		
-		remote_PrimaryAddress="${remote_Address[0]}"
-		remote_PrimaryAddress="${remote_PrimaryAddress%/*}/128"
-		
-		# combine server_Address to one line:
-		read -r remote_AddressLine < <(IFS=','; echo "${remote_Address[*]}")
-		remote_AddressLine="${remote_AddressLine//,/, }"
-		
-		echo "info: Remote server (PublicKey = $remote_PublicKey) can now reach this local server at: $local_ServerEndpoint"
-		echo "info: Received virtual IP-address assignment: $assigned_AddressLine"
-		
-		# add the server's remote Endpoint as connect_host overwrite, and set as Endpoint fo the new [Peer]-section
-		[ -n "$remote_ListenPort" ] || remote_ListenPort="$connect_port"
-		
-		remote_Endpoint="$connect_host:$remote_ListenPort"
-		
-		if [ -n "$remote_ServerEndpoint" ]
-		then
-			# add missing square brackets to a loose IPv6 address (without port)
-			read -r remote_ServerEndpoint < <(ensure_ipv6_brackets "$remote_ServerEndpoint")
+			assigned_PrimaryAddress="${assigned_Address[0]}"
+			assigned_PrimaryAddress="${assigned_PrimaryAddress%/*}/128"
 			
-			# add missing port argument
-			case "$remote_ServerEndpoint" in
-				\[*\]) # is ipv6-address
-					remote_ServerEndpoint="$remote_ServerEndpoint:$remote_ListenPort"
-				;;
-				*:*) ;; # is host:port definition
-				*)
-					remote_ServerEndpoint="$remote_ServerEndpoint:$remote_ListenPort"
-				;;
-			esac
+			# combine server_Address to one line:
+			read -r assigned_AddressLine < <(join ', ' "${assigned_Address[@]}")
 			
-			# if remote_ServerEndpoint is given, try to resolve it, and overwrite connect_host with the endpoint host
-			case "$remote_ServerEndpoint" in
-				\[*\]:*)
-					# IPv6 address with port
-					remote_Endpoint="$remote_ServerEndpoint"
-				;;
-				[0-9].[0-9].[0-9].[0-9]:*)
-					# IPv4 address with port
-					remote_Endpoint="$remote_ServerEndpoint"
-				;;
-				*:*)
-					# hostname with or without port
-					read -r resolved_Endpoint _ < <(getent hosts "${remote_ServerEndpoint%:*}") || true
-					[ -z "$resolved_Endpoint" ] || remote_Endpoint="$resolved_Endpoint"
-					read -r remote_Endpoint < <(ensure_ipv6_brackets "$remote_Endpoint")
-					remote_Endpoint="$remote_Endpoint:$remote_ListenPort"
-				;;
-			esac
-		fi
-		
-		if "$0" -i "$opts_interface" conf set-server "$remote_PublicKey" <<EOF
+			if [ -z "$assigned_AddressLine" ]
+			then
+				echo "error: Did not receive AllowedIPs from remote server. Is the local server ($local_PublicKey) authorized?"
+				echo "note: The remote server may authorize this local server using: $0 server allow '$local_PublicKey' <<<'Type=server'"
+				exit 1
+			fi
+			
+			# filter our own local address from remote address, as it might be contained by remote address since it could be a relay for us
+			# this would create a loop, so that is avoided here
+			filtered_remote_Address=()
+			while read -r address
+			do
+				filtered_remote_Address+=("$address")
+				
+			done < <(grep -Fvxf <(join $'\n' "${local_Address[@]}") <(join $'\n' "${remote_Address[@]}"))
+			remote_Address=("${filtered_remote_Address[@]}")
+			
+			remote_PrimaryAddress="${remote_Address[0]}"
+			remote_PrimaryAddress="${remote_PrimaryAddress%/*}/128"
+			
+			# combine server_Address to one line:
+			read -r remote_AddressLine < <(join ', ' "${remote_Address[@]}")
+			
+			echo "info: Remote server (PublicKey = $remote_PublicKey) can now reach this local server at: $local_ServerEndpoint"
+			echo "info: Received virtual IP-address assignment: $assigned_AddressLine"
+			
+			# add the server's remote Endpoint as connect_host overwrite, and set as Endpoint fo the new [Peer]-section
+			[ -n "$remote_ListenPort" ] || remote_ListenPort="$connect_port"
+			
+			# fix Endpoint to be complete with ListenPort
+			if [ -n "$remote_Endpoint" ]
+			then
+				# add missing square brackets to a loose IPv6 address (without port)
+				read -r remote_Endpoint < <(ensure_ipv6_brackets "$remote_Endpoint")
+				
+				# add missing port argument
+				case "$remote_Endpoint" in
+					\[*\]) # is ipv6-address
+						remote_Endpoint="$remote_Endpoint:$remote_ListenPort"
+					;;
+					*:*) ;; # is host:port definition
+					*)
+						remote_Endpoint="$remote_Endpoint:$remote_ListenPort"
+					;;
+				esac
+				
+				# override Endpoint with the server settings
+				remote_Endpoint="$remote_Endpoint"
+			else
+				# set to same hostname as used to connect, and add port explicitly
+				remote_Endpoint="$connect_host:$remote_ListenPort"
+			fi
+			
+			if "$0" -i "$opts_interface" conf set-peer "$remote_PublicKey" <<EOF
 [Peer]
 Type = server
 AllowedIPs = $remote_AddressLine
 Endpoint = $remote_Endpoint
-ServerEndpoint = $remote_ServerEndpoint
 EOF
-		then
-			echo "info: Success."
-		else
-			echo "error: Failed to update configuration ($0 -i $opts_interface conf set-server $remote_PublicKey)."
-			exit 1
-		fi
-		
-		"$0" wg up "$opts_interface"
-		
-		"$0" wg show "$opts_interface"
-	
-	elif [ "$opts_command" = "listen" ]
-	then
-		read -r opts_bind_host < <(ensure_ipv6_brackets "$opts_bind_host")
-		listen_port="$1"
-		
-		if [ -n "$listen_port" ] && [ "$listen_port" != "$local_ListenPort" ] || ! $local_ListenPort_configured
-		then
-			local_ListenPort="${listen_port:-$WIREGUARD_PORT}"
+			then
+				echo "info: Success."
+			else
+				echo "error: Failed to update configuration ($0 -i $opts_interface conf set-peer $remote_PublicKey)."
+				exit 1
+			fi
 			
-			echo "info: Updating ListenPort in Interface-section."
-			if "$0" -i "$opts_interface" conf set-interface <<EOF
+			"$0" up "$opts_interface"
+			
+			"$0" show "$opts_interface"
+		;;
+		listen)
+			set -e # exit on any failure
+			
+			read -r opts_bind_host < <(ensure_ipv6_brackets "$opts_bind_host")
+			listen_port="$1"
+			
+			if [ -n "$listen_port" ] && [ "$listen_port" != "$local_ListenPort" ] || ! $local_ListenPort_configured
+			then
+				local_ListenPort="${listen_port:-$WIREGUARD_PORT}"
+				
+				echo "info: Updating ListenPort in Interface-section."
+				if "$0" -i "$opts_interface" conf set-interface <<EOF
 ListenPort = $local_ListenPort
 EOF
-			then
-				local_ListenPort_configured=true
-			fi
-		fi
-		
-		"$0" wg up "$opts_interface"
-		
-		echo "Listening on $opts_bind_host:$local_ListenPort with public key: $local_PublicKey"
-		
-		cmd=("$0")
-		for ((i=1;i<opts_verbosity;i++))
-		do
-			cmd+=("-v")
-		done
-		cmd+=("-i" "'$opts_interface'")
-		cmd+=("-k" "$opts_persistent_keepalive_s")
-		cmd+=("server" "accept" "'$local_PublicKey'")
-		
-		tcp_listen="tcp-listen"
-		if [ "${opts_bind_host:0:1}" = "[" ]
-		then
-			tcp_listen="tcp6-listen"
-		fi
-		
-		if ! is_num "$local_ListenPort"
-		then
-			echo "error: Invalid listen port (ListenPort = $local_ListenPort). Check configuration."
-			exit 1
-		fi
-		
-		socat "$tcp_listen":"$local_ListenPort",bind="$opts_bind_host",reuseaddr,fork system:"${cmd[*]}"
-
-	elif [ "$opts_command" = "accept" ]
-	then
-		local_PublicKey="$1"
-		
-		[ "$opts_verbosity" -ge 1 ] && echo "info: Remote[]: Connected." >&2
-		[ "$opts_verbosity" -ge 1 ] && trap 'echo "info: Remote[$remote_PublicKey]: Disconnected." >&2' EXIT
-		
-		# peer can send:
-		remote_PublicKey=""      # the remote Peer's PublicKey (mandatory)
-		remote_Type=""           # remote Type: client or server (optional)
-		# in case of client:
-		remote_InterfaceID=""    # the MAC-address or some other preferred unique identifier of this client (optional)
-		# in case of server:
-		remote_Address=()        # how to reach the server directly, and a mask specifying which clients it can also support, and $[0-9]+ for a cost metric for relaying servers (mandatory)
-		remote_ServerEndpoint="" # how to reach this server from outside (optional, but sort of mandatory if server, otherwise the connection is only half)
-		set_remote_ServerEndpoint=false
-		
-		while read -r line
-		do
-			sock_receive "$line"
-			
-			case "${line// /}" in
-				PublicKey=*)
-					read -r remote_PublicKey <<<"${line#*=}"
-				;;
-				Type=*)
-					read -r remote_Type < <(strtolower "${line#*=}")
-				;;
-				InterfaceID=*)
-					read -r remote_InterfaceID <<<"${line#*=}"
-				;;
-				Address=*)
-					while read -d ',' -r subline
-					do
-						read -r subline <<<"$subline"
-						if [ -n "$subline" ]
-						then
-							remote_Address+=("$subline")
-						fi
-					done <<<"${line#*=},"
-				;;
-				ServerEndpoint=*)
-					set_remote_ServerEndpoint=true
-					read -r remote_ServerEndpoint <<<"${line#*=}"
-				;;
-			esac
-			
-		done # read from stdin, client must close stdin before server can continue (that is to half-close socket on their end)
-		
-		if [ -z "$remote_PublicKey" ]
-		then
-			echo "warn: Remote[$remote_PublicKey]: Bad protocol. PublicKey not given." >&2
-			sock_send "# [server]: Unauthorized (no PublicKey received)."
-			sock_send "Error = 401 Unauthorized"
-			exit 41
-		fi
-		
-		# send information about this server's wireguard configuration to the client socket (stdout):
-		sock_send "[Interface]"
-		sock_send "PublicKey = $local_PublicKey"
-		
-		# print ListenPort if it exists (it should exist, otherwise that is a warning, how can a client expect to guess the ListenPort if it is dynamic or unknown)
-		[ -z "$local_ListenPort" ] || sock_send "ListenPort = $local_ListenPort"
-		
-		# grab ServerEndpoint and print if exists (this is the Interface-section, so ServerEndpoint should not have a port)
-		[ -z "$local_ServerEndpoint" ] || sock_send "ServerEndpoint = $local_ServerEndpoint"
-		
-		# grab MeshEndpoint and print if exists, this should be a DNS that resolves to multiple addresses, every one specifying one server in the Mesh network
-		# the client should use this over the Endpoint, if it exists, but a server will simply use the Endpoint, because it must have one unique Endpoint for each unique Peer
-		read -r local_MeshEndpoint < <("$0" -i "$opts_interface" conf get-interface MeshEndpoint)
-		[ -z "$local_MeshEndpoint" ] || sock_send "MeshEndpoint = $local_MeshEndpoint"
-		
-		# grab the latest known SubnetMask
-		read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask)
-		
-		
-		# get peer section
-		if ! peer_info="$("$0" -i "$opts_interface" conf get-peer "$remote_PublicKey")"
-		then
-			# Peer is not authorized
-			echo "warn: Remote[$remote_PublicKey]: Not authorized (PublicKey = $remote_PublicKey). To authorize, run: $0 server allow $remote_PublicKey" >&2
-			sock_send "# [server]: Forbidden."
-			sock_send "Error = 403 Forbidden"
-			exit 43
-		fi
-		
-		# parse [Peer]-section from configuration
-		peer_Type=""
-		peer_AllowedIPs=()
-		peer_Endpoint=""
-		peer_ServerEndpoint=""
-		peer_PersistentKeepalive=""
-		
-		while read -r line
-		do
-			# trim comments
-			line="${line%%#*}"
-			
-			case "${line// /}" in
-				Type=*)
-					read -r peer_Type < <(strtolower "${line#*=}")
-				;;
-				Endpoint=*)
-					read -r peer_Endpoint <<<"${line#*=}"
-					
-					# autodetected server-type, but don't overwrite if already set
-					[ -z "$peer_Endpoint" ] || [ -n "$peer_Type" ] || peer_Type="server"
-				;;
-				ServerEndpoint=*)
-					read -r peer_ServerEndpoint <<<"${line#*=}"
-					
-					# autodetected server-type, but don't overwrite if already set
-					[ -z "$peer_ServerEndpoint" ] || [ -n "$peer_Type" ] || peer_Type="server"
-				;;
-				AllowedIPs=*)
-					while read -d ',' -r subline
-					do
-						read -r subline <<<"$subline"
-						if [ -n "$subline" ]
-						then
-							# autodetect server-type, but don't overwrite if already set
-							case "$subline" in
-								*/128) ;;
-								*/*) [ -n "$peer_Type" ] || peer_Type="server"
-							esac
-							
-							peer_AllowedIPs+=("$subline")
-						fi
-					done <<<"${line#*=},"
-				;;
-				PersistentKeepalive=*)
-					read -r peer_PersistentKeepalive <<<"${line#*=}"
-				;;
-			esac
-		done <<<"$peer_info"
-		
-		if [ "$peer_Type" = "server" ]
-		then
-			# peer is an authorized server, connecting with us again
-			lines=()
-			
-			# Address was received, and Address differs from AllowedIPs
-			if [ "${#remote_Address[@]}" -gt 0 ] && [ "${peer_AllowedIPs[*]}" != "${remote_Address[*]}" ]
-			then
-				# combine server_Address to one line:
-				read -r remote_AddressLine < <(IFS=','; echo "${remote_Address[*]}")
-				remote_AddressLine="${remote_AddressLine//,/, }"
-				
-				lines+=("AllowedIPs = $remote_AddressLine")
-			fi
-			
-			# ServerEndpoint was received, and ServerEndpoint differs from ServerEndpoint
-			if $set_remote_ServerEndpoint && [ "$remote_ServerEndpoint" != "$peer_ServerEndpoint" ]
-			then
-				# the connecting peer is responsible for adding its own ListenPort to the ServerEndpoint address
-				lines+=("ServerEndpoint = $remote_ServerEndpoint")
-			fi
-			
-			# Ensure PersistentKeepalive is set to our current options (in case [Peer] will be created for the first time, or configuration was manually changed)
-			if [ "$peer_PersistentKeepalive" != "$opts_persistent_keepalive_s" ]
-			then
-				lines+=("PersistentKeepalive = $opts_persistent_keepalive_s")
-			fi
-			
-			# if any new lines need to be added
-			if [ "${#lines[@]}" -gt 0 ]
-			then
-				# update configuration file
-				if "$0" -i "$opts_interface" conf set-server "$remote_PublicKey" < <(
-					echo "[Peer]"
-					echo "Type = server"
-					for line in "${lines[@]}"
-					do
-						echo "$line"
-					done
-				) >&2
 				then
-					# apply new configuration to Wireguard interface
-					"$0" wg update "$opts_interface" >&2
-				else
-					echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
-					sock_send "# [server]: 500 Internal Server Error"
-					sock_send "Error = 500 Internal Server Error"
-					exit 50
+					local_ListenPort_configured=true
 				fi
 			fi
 			
-		else
-			
-			if [ "$remote_Type" = "server" ]
+			# pass masquerade on here TODO: replace with updating Interface section with our Masquerade link-device, for instance: MasqueradeDevice = ens3
+			cmd=("$0")
+			if [ -n "$opts_masquerade_interface" ]
 			then
-				# this server wants to connect as a server, but it is not allowed as a server here
-				# that is an error
-				echo "warn: Remote[$remote_PublicKey]: Client wants to connect as a server, but is not authorized as a server. To authorize client as a server, run: $0 server allow $remote_PublicKey <<<Type=server" >&2
-				sock_send "# [server]: Forbidden (not authorized as a server)."
+				cmd+=("--masquerade" "$opts_masquerade_interface")
+			fi
+			"${cmd[@]}" up "$opts_interface"
+			
+			echo "Listening on $opts_bind_host:$local_ListenPort with public key: $local_PublicKey"
+			
+			cmd=("$0")
+			for ((i=1;i<opts_verbosity;i++))
+			do
+				cmd+=("-v")
+			done
+			cmd+=("-i" "'$opts_interface'")
+			cmd+=("-k" "$opts_persistent_keepalive_s")
+			cmd+=("server" "accept" "'$local_PublicKey'")
+			
+			tcp_listen="tcp-listen"
+			if [ "${opts_bind_host:0:1}" = "[" ]
+			then
+				tcp_listen="tcp6-listen"
+			fi
+			
+			if ! is_num "$local_ListenPort"
+			then
+				echo "error: Invalid listen port (ListenPort = $local_ListenPort). Check configuration."
+				exit 1
+			fi
+			
+			socat "$tcp_listen":"$local_ListenPort",bind="$opts_bind_host",reuseaddr,fork system:"${cmd[*]}"
+		;;
+		accept)
+			local_PublicKey="$1"
+			
+			[ "$opts_verbosity" -ge 1 ] && echo "info: Remote[]: Connected." >&2
+			[ "$opts_verbosity" -ge 1 ] && trap 'echo "info: Remote[$remote_PublicKey]: Disconnected." >&2' EXIT
+			
+			# peer can send:
+			remote_PublicKey=""      # the remote Peer's PublicKey (mandatory)
+			remote_Type=""           # remote Type: client or server (optional)
+			# in case of client:
+			remote_InterfaceID=""    # the MAC-address or some other preferred unique identifier of this client (optional)
+			# in case of server:
+			remote_Address=()        # how to reach the server directly, and a mask specifying which clients it can also support, and $[0-9]+ for a cost metric for relaying servers (mandatory)
+			remote_Endpoint=""       # how to reach this server from outside (optional, but sort of mandatory if server, otherwise the connection is only half)
+			set_remote_Endpoint=false
+			
+			while read -t 20 -r line
+			do
+				sock_receive "$line"
+				
+				case "${line// /}" in
+					PublicKey=*)
+						read -r remote_PublicKey <<<"${line#*=}"
+					;;
+					Type=*)
+						read -r remote_Type < <(strtolower "${line#*=}")
+					;;
+					InterfaceID=*)
+						read -r remote_InterfaceID <<<"${line#*=}"
+					;;
+					Address=*)
+						split ',' "${line#*=}" remote_Address
+					;;
+					Endpoint=*)
+						set_remote_Endpoint=true
+						read -r remote_Endpoint <<<"${line#*=}"
+					;;
+				esac
+				
+			done # read from stdin, client must close stdin before server can continue (that is to half-close socket on their end)
+			
+			if [ -z "$remote_PublicKey" ]
+			then
+				echo "warn: Remote[$remote_PublicKey]: Bad protocol. PublicKey not given." >&2
+				sock_send "Error = 401 Unauthorized (no PublicKey in request)"
+				exit 41
+			fi
+			
+			# send information about this server's wireguard configuration to the client socket (stdout):
+			interface_block=("[Interface]")
+			interface_block+=("PublicKey = $local_PublicKey")
+			
+			# print ListenPort if it exists (it should exist, otherwise that is a warning, how can a client expect to guess the ListenPort if it is dynamic or unknown)
+			[ -z "$local_ListenPort" ] || interface_block+=("ListenPort = $local_ListenPort")
+			
+			# grab Endpoint and print if exists, it should be the public address of this server, possibly DNS with round-robin
+			[ -z "$local_Endpoint" ] || interface_block+=("Endpoint = $local_Endpoint")
+			
+			# grab the latest known SubnetMask
+			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask)
+			
+			# get peer section
+			if ! peer_info="$("$0" -i "$opts_interface" conf get-peer "$remote_PublicKey")"
+			then
+				# Peer is not authorized
+				echo "warn: Remote[$remote_PublicKey]: Not authorized (PublicKey = $remote_PublicKey). To authorize, run: $0 server allow $remote_PublicKey" >&2
 				sock_send "Error = 403 Forbidden"
+				sock_send_lines "${interface_block[@]}"
 				exit 43
 			fi
 			
-			local_AddressMask=""
-			local_AddressPrefix=""
-			for address in "${local_Address[@]}"
+			# parse [Peer]-section from configuration
+			peer_Type=""
+			peer_AllowedIPs=()
+			peer_Endpoint=""
+			peer_PersistentKeepalive=""
+			
+			while read -r line
 			do
-				case "$address" in
-					*/128|*/128\$*|*/) ;;
-					*/*)
-						# trim cost
-						address="${address%\$*}"
+				# trim comments
+				line="${line%%#*}"
+				
+				case "${line// /}" in
+					Type=*)
+						read -r peer_Type < <(strtolower "${line#*=}")
+					;;
+					Endpoint=*)
+						read -r peer_Endpoint <<<"${line#*=}"
 						
-						local_AddressPrefix="${address%/*}"
-						local_AddressMask="${address#*/}"
+						# autodetected server-type, but don't overwrite if already set
+						[ -z "$peer_Endpoint" ] || [ -n "$peer_Type" ] || peer_Type="server"
+					;;
+					AllowedIPs=*)
+						split ',' "${line#*=}" peer_AllowedIPs
 						
-						# apply mask to the prefix to really turn it into a prefix
-						read -r local_AddressPrefix < <(expand_ipv6 "$local_AddressPrefix")
-						local_AddressPrefix="${local_AddressPrefix//:/}"
-						hexdigit_count="$((local_AddressMask / 4))"
-						local_AddressPrefix="${local_AddressPrefix:0:$hexdigit_count}"
-						read -r local_AddressPrefix < <(sed -e 's/.\{4\}/&:/g;s/:$//' <<<"$local_AddressPrefix")
-						read -r local_AddressPrefix < <(compress_ipv6 "$local_AddressPrefix")
-						
-						break # from for-loop, the first address with server-mask is chosen as prefix/mask
+						# autodetect server-type, but don't overwrite if already set
+						case "${peer_AllowedIPs[${#peer_AllowedIPs[@]}]}" in
+							*/128) ;;
+							*/*) [ -n "$peer_Type" ] || peer_Type="server"
+						esac
+					;;
+					PersistentKeepalive=*)
+						read -r peer_PersistentKeepalive <<<"${line#*=}"
 					;;
 				esac
-			done
+			done <<<"$peer_info"
 			
-			if [ -z "$local_AddressMask" ]
+			if [ "$peer_Type" = "server" ]
 			then
-				echo "error: Remote[$remote_PublicKey]: Local server is not currently a server (no Address mask has been specified, check configuration)." >&2
-				sock_send "# [server]: 503 Service Unavailable (Invalid server configuration)"
-				sock_send "Error = 503 Service Unavailable"
-				exit 53
-			fi
-			
-			# peer is an authorized client (only the first AllowedIPs is considered)
-			client_addr="${peer_AllowedIPs[0]}"
-			
-			# if client_addr starts with :, then automatically prepend the prefix&subnet
-			if [ -n "$client_addr" ] && [ "${client_addr:0:1}" = ":" ]
-			then
-				# prepend prefix and subnet:
-				client_addr="$local_AddressPrefix$client_addr"
+				# peer is an authorized server, connecting with us again
+				lines=()
 				
-				# client_addr is allowed to be a partial address ending with a subnet mask, so that client's Interface ID can overwrite that part
-			fi
-			
-			# validate ipv6 address (ip exit code is 1 if parse error)
-			if is_ipv6 "$client_addr"
-			then
-				echo "info: Remote[$remote_PublicKey]: Found statically configured IPv6 address ($client_addr)." >&2
+				# Address was received, and Address differs from AllowedIPs
+				if [ "${#remote_Address[@]}" -gt 0 ] && [ "${peer_AllowedIPs[*]}" != "${remote_Address[*]}" ]
+				then
+					# combine server_Address to one line:
+					read -r remote_AddressLine < <(join ', ' "${remote_Address[@]}")
+					
+					lines+=("AllowedIPs = $remote_AddressLine")
+				fi
 				
-				# expand client_addr
-				read -r client_addr < <(expand_ipv6 "$client_addr")
+				# Endpoint was received, and Endpoint differs from Endpoint
+				if $set_remote_Endpoint && [ "$remote_Endpoint" != "$peer_Endpoint" ]
+				then
+					# the connecting peer is responsible for adding its own ListenPort to the Endpoint address
+					lines+=("Endpoint = $remote_Endpoint")
+				fi
+				
+				# Ensure PersistentKeepalive is set to our current options (in case [Peer] will be created for the first time, or configuration was manually changed)
+				if [ "$peer_PersistentKeepalive" != "$opts_persistent_keepalive_s" ]
+				then
+					lines+=("PersistentKeepalive = $opts_persistent_keepalive_s")
+				fi
+				
+				# if any new lines need to be added
+				if [ "${#lines[@]}" -gt 0 ]
+				then
+					# update configuration file
+					if "$0" -i "$opts_interface" conf set-peer "$remote_PublicKey" < <(
+						echo "[Peer]"
+						echo "Type = server"
+						for line in "${lines[@]}"
+						do
+							echo "$line"
+						done
+					) >&2
+					then
+						# apply new configuration to Wireguard interface
+						"$0" update "$opts_interface" >&2
+					else
+						echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
+						sock_send "Error = 500 Internal Server Error"
+						sock_send_lines "${interface_block[@]}"
+						exit 50
+					fi
+				fi
+				
 			else
-				# mark as invalid address
-				client_addr=""
-			fi
-			
-			# if the client's Interface ID is provided, and if client_addr ends with a mask (e.g. /64), then overwrite the last digits with the client's Interface ID
-			hexdigit_count="32"
-			case "$client_addr" in
-				*/*)
-					client_addr_mask="${client_addr%%*/}"
-					
-					if is_num "$client_addr_mask"
-					then
-						hexdigit_count="$((client_addr_mask / 4))"
-					fi
-				;;
-			esac
-			
-			# Retry using Client's Interface ID if provided
-			if [ -n "$remote_InterfaceID" ] && {
-					[ -z "$client_addr" ] || [ "$hexdigit_count" -lt 32 ]
-				}
-			then
-				if is_ipv6 "$remote_InterfaceID"
+				
+				if [ "$remote_Type" = "server" ]
 				then
-					read -r remote_InterfaceID_hex < <(expand_ipv6 "$remote_InterfaceID")
-				else
-					# else: could be a MAC-address, or any hexidecimal string
-					read -r remote_InterfaceID_hex <<<"$remote_InterfaceID"
+					# this server wants to connect as a server, but it is not allowed as a server here
+					# that is an error
+					echo "warn: Remote[$remote_PublicKey]: Client wants to connect as a server, but is not authorized as a server. To authorize client as a server, run: $0 server allow $remote_PublicKey <<<Type=server" >&2
+					sock_send "Error = 403 Forbidden (not authorized as server)"
+					sock_send_lines "${interface_block[@]}"
+					exit 43
 				fi
 				
-				# remove colons (if IPv6 it must already be expanded, so this is safe to do)
-				# actually, remove any non-[a-f0-9] character
-				read -r remote_InterfaceID_hex < <(strtolower "$(sed -r -e 's/[^0-9a-f]+//gi' <<<"$remote_InterfaceID_hex")")
+				local_AddressMask=""
+				local_AddressPrefix=""
+				for address in "${local_Address[@]}"
+				do
+					case "$address" in
+						*/128|*/128\$*|*/) ;;
+						*/*)
+							# trim cost
+							address="${address%\$*}"
+							
+							local_AddressPrefix="${address%/*}"
+							local_AddressMask="${address#*/}"
+							
+							# apply mask to the prefix to really turn it into a prefix
+							read -r local_AddressPrefix < <(expand_ipv6 "$local_AddressPrefix")
+							local_AddressPrefix="${local_AddressPrefix//:/}"
+							hexdigit_count="$((local_AddressMask / 4))"
+							local_AddressPrefix="${local_AddressPrefix:0:$hexdigit_count}"
+							read -r local_AddressPrefix < <(hex_to_expanded_ipv6 "$local_AddressPrefix")
+							read -r local_AddressPrefix < <(compress_ipv6 "$local_AddressPrefix")
+							
+							break # from for-loop, the first address with server-mask is chosen as prefix/mask
+						;;
+					esac
+				done
 				
-				sock_send "# [server]: Interface hex: $remote_InterfaceID_hex (hexdigit_count: $hexdigit_count based on $client_addr using $local_AddressMask)"
-				
-				# preserve first $digit_count digits of the client_addr, and substitute the rest with client_interface_id, if a mask was provided for the client
-				if [ "$hexdigit_count" -lt 32 ]
+				if [ -z "$local_AddressMask" ]
 				then
-					# if hexdigit_count < 32, then client_addr MUST have matched */*, meaning it's not empty, and expanded
-					client_addr="${client_addr%/*}"
-					# recombine hexdigits up to hexdigit_count, client_addr is already expanded
-					client_addr="${client_addr//:/}"
-					client_addr="${client_addr:0:$hexdigit_count}$remote_InterfaceID_hex"
-				else
-					# set client_addr to address prefix
-					read -r client_addr < <(expand_ipv6 "$local_AddressPrefix::")
-					
-					# add client's Interface ID not before the end of AddressPrefix
-					client_addr="${client_addr//:/}"
-					client_addr_prefix="${client_addr:0:$((local_AddressMask / 4))}"
-					offset="${#client_addr_prefix}"
-					
-					# for security, ensure that offset is not lower than $local_SubnetMask
-					subnet_offset="$((local_SubnetMask / 4))"
-					if [ "$offset" -lt "$subnet_offset" ]
-					then
-						offset="$subnet_offset"
-					fi
-					
-					# if the remote Interface ID is not long enough to fill up the zeroes, move offset even more to the right (align to right)
-					if [ "${#remote_InterfaceID_hex}" -lt "$((32 - offset))" ]
-					then
-						offset="$((32 - ${#remote_InterfaceID_hex}))"
-					fi
-					
-					# add remote Interface ID at the given offset
-					client_addr="${client_addr:0:$offset}$remote_InterfaceID_hex"
+					echo "error: Remote[$remote_PublicKey]: Local server is not currently a server (no Address mask has been specified, check configuration)." >&2
+					sock_send "Error = 503 Service Unavailable (invalid server configuration)"
+					sock_send_lines "${interface_block[@]}"
+					exit 53
 				fi
 				
-				# limit to 32 digits
-				client_addr="${client_addr:0:32}"
-				# insert colons every 4 digits, client_addr is currently a hexstring without colons
-				read -r client_addr < <(sed -e 's/.\{4\}/&:/g;s/:$//' <<<"$client_addr")
+				# peer is an authorized client (only the first AllowedIPs is considered)
+				client_addr="${peer_AllowedIPs[0]}"
+				
+				# if client_addr starts with :, then automatically prepend the prefix&subnet
+				case "$client_addr" in
+					:*) client_addr="$local_AddressPrefix$client_addr"
+				esac
 				
 				# validate ipv6 address (ip exit code is 1 if parse error)
 				if is_ipv6 "$client_addr"
 				then
-					echo "info: Remote[$remote_PublicKey]: Using IPv6 address ($client_addr) with Interface ID provided by client ($remote_InterfaceID)." >&2
-				else
-					echo "warning: Remote[$remote_PublicKey]: Interface ID ($remote_InterfaceID) provided by client is invalid ($client_addr)." >&2
+					echo "info: Remote[$remote_PublicKey]: Found statically configured IPv6 address ($client_addr)." >&2
 					
-					# clear the invalid address
+					# expand client_addr
+					read -r client_addr < <(expand_ipv6 "$client_addr")
+				else
+					# mark as invalid address
 					client_addr=""
 				fi
-			fi
-			
-			# fallback to automatic iterative IP-address assignment
-			if [ -z "$client_addr" ]
-			then
-				# find unused ipv6 address
-				# ::1 is typically reserved for the server's own address, start at 2
-				count=2
-				client_addr="$local_AddressPrefix::$count"
 				
-				# the mask might limit clients to an even lower limit than 4 hex-digits
-				max_clients="$((2**((128 - $local_AddressMask)/2)))"
-				if [ "$max_clients" -gt 65536 ]
-				then
-					# hard-limit to 65536 clients, otherwise the code to generate client ID's needs to be updated
-					max_clients=65536
-				fi
-				
-				# we could also use "$0" conf has-address <Address>, to check for uniqueness
-				while [ "$count" -lt "$max_clients" ] && "$0" -i "$opts_interface" conf has-address "$client_addr"
-				do
-					# add 1 to the last hex group (this method limits the number of clients to a maximum of 65534 clients)
-					client_addr="${client_addr%:*}:$(printf '%x' "$((16#${client_addr##*:} + 1))")"
-					
-					count=$((count + 1))
-				done
-				
-				if [ "$count" -eq "$max_clients" ]
-				then
-					echo "error: Remote[$remote_PublicKey]: Address space exhausted, too many clients ($count)." >&2
-					sock_send "# [server]: 507 Insufficient Storage (Address space exhausted, too many clients)"
-					sock_send "Error = 507 Insufficient Storage"
-					exit 57
-				fi
-			fi
-			
-			# compress client_addr
-			read -r client_addr < <(compress_ipv6 "$client_addr")
-			
-			# check if our client_addr is new/changed:
-			if [ "$client_addr" != "${peer_AllowedIPs[0]}" ]
-			then
-				# check if address is unique:
-				if "$0" -i "$opts_interface" conf has-address "$client_addr"
-				then
-					echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it already exists in the configuration as an Address or AllowedIPs ($conf_file)." >&2
-					sock_send "# [server]: 409 Conflict (Forbidden address: $client_addr, not unique)"
-					sock_send "Error = 409 Conflict"
-					exit 49
-				fi
-				
+				# if the client's Interface ID is provided, and if client_addr ends with a mask (e.g. /64), then overwrite the last digits with the client's Interface ID
+				hexdigit_count="32"
 				case "$client_addr" in
-					*::|*:0)
-						echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it ends with :: or :0." >&2
-						sock_send "# [server]: 409 Conflict (Forbidden address: $client_addr, ends with :: or :0)"
-						sock_send "Error = 409 Conflict"
-						exit 49
-					;;
-					"$local_AddressPrefix"*) ;; # this is correct, client_addr should be in the subnet of this server
-					*)
-						echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it does not start with the server prefix ($local_AddressPrefix)." >&2
-						sock_send "# [server]: 409 Conflict (Forbidden address: $client_addr, bad prefix)"
-						sock_send "Error = 409 Conflict"
-						exit 49
+					*/*)
+						client_addr_mask="${client_addr%%*/}"
+						
+						if is_num "$client_addr_mask"
+						then
+							hexdigit_count="$((client_addr_mask / 4))"
+						fi
 					;;
 				esac
 				
-				# check if client_addr is unique (must be done by set-peer, for atomic locking purposes)
-				if "$0" -i "$opts_interface" conf set-client "$remote_PublicKey" >&2 <<EOF
-[Peer]
+				# Retry using Client's Interface ID if provided
+				if [ -n "$remote_InterfaceID" ] && {
+						[ -z "$client_addr" ] || [ "$hexdigit_count" -lt 32 ]
+					}
+				then
+					if is_ipv6 "$remote_InterfaceID"
+					then
+						read -r remote_InterfaceID_hex < <(expand_ipv6 "$remote_InterfaceID")
+					else
+						# else: could be a MAC-address, or any hexidecimal string
+						read -r remote_InterfaceID_hex <<<"$remote_InterfaceID"
+					fi
+					
+					# remove colons (if IPv6 it must already be expanded, so this is safe to do)
+					# actually, remove any non-[a-f0-9] character
+					read -r remote_InterfaceID_hex < <(strtolower "$(sed -r -e 's/[^0-9a-f]+//gi' <<<"$remote_InterfaceID_hex")")
+					
+					# preserve first $digit_count digits of the client_addr, and substitute the rest with client_interface_id, if a mask was provided for the client
+					if [ "$hexdigit_count" -lt 32 ]
+					then
+						# if hexdigit_count < 32, then client_addr MUST have matched */*, meaning it's not empty, and expanded
+						client_addr="${client_addr%/*}"
+						# recombine hexdigits up to hexdigit_count, client_addr is already expanded
+						client_addr="${client_addr//:/}"
+						client_addr="${client_addr:0:$hexdigit_count}$remote_InterfaceID_hex"
+					else
+						# set client_addr to address prefix
+						read -r client_addr < <(expand_ipv6 "$local_AddressPrefix::")
+						
+						# add client's Interface ID not before the end of AddressPrefix
+						client_addr="${client_addr//:/}"
+						client_addr_prefix="${client_addr:0:$((local_AddressMask / 4))}"
+						offset="${#client_addr_prefix}"
+						
+						# for security, ensure that offset is not lower than $local_SubnetMask
+						subnet_offset="$((local_SubnetMask / 4))"
+						if [ "$offset" -lt "$subnet_offset" ]
+						then
+							offset="$subnet_offset"
+						fi
+						
+						# if the remote Interface ID is not long enough to fill up the zeroes, move offset even more to the right (align to right)
+						if [ "${#remote_InterfaceID_hex}" -lt "$((32 - offset))" ]
+						then
+							offset="$((32 - ${#remote_InterfaceID_hex}))"
+						fi
+						
+						# add remote Interface ID at the given offset
+						client_addr="${client_addr:0:$offset}$remote_InterfaceID_hex"
+					fi
+					
+					# insert colons every 4 digits, client_addr is currently a hexstring without colons
+					read -r client_addr < <(hex_to_expanded_ipv6 "$client_addr")
+					
+					# validate ipv6 address (ip exit code is 1 if parse error)
+					if is_ipv6 "$client_addr"
+					then
+						echo "info: Remote[$remote_PublicKey]: Using IPv6 address ($client_addr) with Interface ID provided by client ($remote_InterfaceID)." >&2
+					else
+						echo "warning: Remote[$remote_PublicKey]: Interface ID ($remote_InterfaceID) provided by client is invalid ($client_addr)." >&2
+						
+						# clear the invalid address
+						client_addr=""
+					fi
+				fi
+				
+				# fallback to automatic iterative IP-address assignment
+				if [ -z "$client_addr" ]
+				then
+					# find unused ipv6 address
+					# ::1 is typically reserved for the server's own address, start at 2
+					count=2
+					client_addr="$local_AddressPrefix::$count"
+					
+					# the mask might limit clients to an even lower limit than 4 hex-digits
+					max_clients="$((2**((128 - $local_AddressMask)/2)))"
+					if [ "$max_clients" -gt 65536 ]
+					then
+						# hard-limit to 65536 clients, otherwise the code to generate client ID's needs to be updated
+						max_clients=65536
+					fi
+					
+					# we could also use "$0" conf has-address <Address>, to check for uniqueness
+					while [ "$count" -lt "$max_clients" ] && "$0" -i "$opts_interface" conf has-address "$client_addr"
+					do
+						# add 1 to the last hex group (this method limits the number of clients to a maximum of 65534 clients)
+						client_addr="${client_addr%:*}:$(printf '%x' "$((16#${client_addr##*:} + 1))")"
+						
+						count=$((count + 1))
+					done
+					
+					if [ "$count" -eq "$max_clients" ]
+					then
+						echo "error: Remote[$remote_PublicKey]: Address space exhausted, too many clients ($count)." >&2
+						sock_send "Error = 507 Insufficient Storage (address space exhausted, too many clients)"
+						sock_send_lines "${interface_block[@]}"
+						exit 57
+					fi
+				fi
+				
+				# compress client_addr
+				read -r client_addr < <(compress_ipv6 "$client_addr")
+				
+				# check if our client_addr is new/changed:
+				if [ "$client_addr" != "${peer_AllowedIPs[0]}" ]
+				then
+					# check if address is unique:
+					if "$0" -i "$opts_interface" conf has-address "$client_addr"
+					then
+						echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it already exists in the configuration as an Address or AllowedIPs ($conf_file)." >&2
+						sock_send "Error = 409 Conflict (forbidden address: $client_addr, not unique)"
+						sock_send_lines "${interface_block[@]}"
+						exit 49
+					fi
+					
+					case "$client_addr" in
+						*::|*:0)
+							echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it ends with :: or :0." >&2
+							sock_send "Error = 409 Conflict (forbidden address: $client_addr, ends with :: or :0)"
+							sock_send_lines "${interface_block[@]}"
+							exit 49
+						;;
+						"$local_AddressPrefix"*) ;; # this is correct, client_addr should be in the subnet of this server
+						*)
+							echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it does not start with the server prefix ($local_AddressPrefix)." >&2
+							sock_send "Error = 409 Conflict (forbidden address: $client_addr, bad prefix)"
+							sock_send_lines "${interface_block[@]}"
+							exit 49
+						;;
+					esac
+					
+					# check if client_addr is unique (must be done by set-peer, for atomic locking purposes)
+					if "$0" -i "$opts_interface" conf set-peer "$remote_PublicKey" >&2 <<EOF
 Type = client
 AllowedIPs = $client_addr
 EOF
-				then
-					echo "info: Remote[$remote_PublicKey]: Configuration updated. Peer (PublicKey = $remote_PublicKey) added with virtual IP-address: $client_addr" >&2
-					
-					# refresh Wireguard configuration
-					"$0" wg update "$opts_interface" >&2
-				else
-					echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
-					sock_send "# [server]: 500 Internal Server Error"
-					sock_send "Error = 500 Internal Server Error"
-					exit 50
+					then
+						echo "info: Remote[$remote_PublicKey]: Configuration updated. Peer (PublicKey = $remote_PublicKey) added with virtual IP-address: $client_addr" >&2
+						
+						# refresh Wireguard configuration
+						"$0" update "$opts_interface" >&2
+					else
+						echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
+						sock_send "Error = 500 Internal Server Error"
+						sock_send_lines "${interface_block[@]}"
+						exit 50
+					fi
 				fi
 			fi
+			
+			# only if client is authorized (and after possible [Peer]-server section has been updated), we show properties about the internals of this virtual network:
+			sock_send_lines "${interface_block[@]}"
+			
+			# print the local address
+			for address in "${local_Address[@]}"
+			do
+				sock_send "Address = $address"
+			done
+			
+			# here we also want to print every Peer we relay for as our own Address, but with increased cost
+			while read -r address
+			do
+				[ -n "$address" ] || continue
+				
+				case "$address" in
+					*\$*)
+						relay_ip="${address%\$*}"
+						relay_cost="${address#*\$}"
+						
+						if [ -z "$relay_cost" ]
+						then
+							# default relay cost, if no number is indicated at the end, is zero
+							relay_cost="0"
+						fi
+						sock_send "Address = ${relay_ip}\$$((relay_cost + 1))"
+					;;
+					*)
+						sock_send "Address = ${address}\$1"
+					;;
+				esac
+				
+			done < <("$0" -i "$opts_interface" conf list-servers AllowedIPs)
+			
+			# client exists, show all configuration entries of this client:
+			# this is mostly useful for the client so that it may read AllowedIPs and set it as its [Interface]'s Address
+			# note on security: anyone who knows a client's identifier can discover their IP-address, public key, and potentially other properties
+			
+			while read -r line
+			do
+				sock_send "$line"
+				
+			done < <("$0" -i "$opts_interface" conf get-peer "$remote_PublicKey")
+		;;
+		*)
+			echo "error: Invalid server command ($opts_command)." >&2
+			exit 1
+		;;
+	esac
+}
+
+context_find()
+{
+	# grab address from argument
+	opts_vpn_address="$1"
+	
+	# extract subnet mask, default to default prefix mask
+	find_mask="$opts_subnet_mask"
+	case "$opts_vpn_address" in
+		*/*)
+			find_mask="${opts_vpn_address#*/}"
+			opts_vpn_address="${opts_vpn_address%/*}"
+		;;
+	esac
+	
+	# prefix address with :: before expanding, if needed
+	if ! is_ipv6 "$opts_vpn_address"
+	then
+		case "$opts_vpn_address" in
+			::*) ;;
+			:*)
+				opts_vpn_address=":$opts_vpn_address"
+			;;
+			*)
+				opts_vpn_address="::$opts_vpn_address"
+			;;
+		esac
+	fi
+	
+	# expand address
+	read -r opts_vpn_address < <(expand_ipv6 "$opts_vpn_address")
+	
+	# remove colons
+	opts_vpn_address="${opts_vpn_address//:/}"
+	
+	# remove digits from the front according to the find_mask
+	opts_vpn_address="${opts_vpn_address:$((find_mask / 4))}"
+	
+	addresses=()
+	
+	# find the subnet at which
+	while read -r address _
+	do
+		# extract route mask
+		route_mask="128"
+		case "$address" in
+			*/*)
+				route_mask="${address#*/}"
+				address="${address%/*}"
+			;;
+		esac
+		
+		# expand route address
+		read -r address < <(expand_ipv6 "$address")
+		
+		# remove colons
+		address="${address//:/}"
+		
+		# if route mask is larger than find_mask, only match if the ending part matches exactly
+		if [ "$route_mask" -gt "$find_mask" ]
+		then
+			# check if the address is equal to the opts_vpn_address
+			if [ "${address:$((find_mask / 4))}" = "$opts_vpn_address" ]
+			then
+				read -r address < <(hex_to_expanded_ipv6 "${address:0:$((find_mask / 4))}$opts_vpn_address")
+				
+				#echo "Found local matching address: $address"
+				
+				compress_ipv6 "$address"
+				exit 0
+			fi
+			# else: no match
+			
+		else
+			address="${address:0:$((find_mask / 4))}$opts_vpn_address"
+			
+			# put colons back in
+			read -r address < <(hex_to_expanded_ipv6 "$address")
+			
+			#echo "Going to ping: $address"
+			
+			addresses+=("$address")
 		fi
 		
-		# only if client is authorized (and after possible [Peer]-server section has been updated), we show properties about the internals of this virtual network:
-		
-		# print the local address
-		for address in "${local_Address[@]}"
+	done < <(ip -6 route show dev "$opts_interface") # TODO: possibly sort by metric ascending
+	
+	# only print the first line
+	head -n 1 < <(
+		pids=()
+		for address in "${addresses[@]}"
 		do
-			sock_send "Address = $address"
+			# scan this address in parallel for a result
+			(
+				if ping -6 -n -c 1 -w 2 -W 4 "$address" >/dev/null 2>/dev/null
+				then
+					compress_ipv6 "$address"
+				else
+					exit 1
+				fi
+			) &
+			pids+=($!)
 		done
 		
-		# here we also want to print every Peer we relay for as our own Address, but with increased cost
-		while read -r address
+		# wait for the first job to finish
+		while [ -n "$(jobs -pr)" ]
 		do
-			[ -n "$address" ] || continue
+			wait -n && break
+		done
+		
+		# kill remaining pids
+		while [ -n "$(jobs -pr)" ]
+		do
+			kill %%
+		done
+	)
+}
+
+
+opts_context=""
+opts_interface="$DEFAULT_INTERFACE"
+opts_verbosity="0"
+opts_vpn_address=""
+opts_bind_host="$DEFAULT_BIND_HOST"
+opts_persistent_keepalive_s="$DEFAULT_PERSISTENT_KEEPALIVE_S"
+opts_mac_address=""
+opts_prefix_mask="$DEFAULT_PREFIX_MASK"
+opts_subnet_mask="$DEFAULT_SUBNET_MASK"
+opts_masquerade_interface=""
+opts_no_masquerade=false
+
+while [ "$#" -gt 0 ]
+do
+	case "$1" in
+		--)
+			shift
+			break
+		;;
+		-i|--interface)
+			opts_interface="$2"
+			shift
+		;;
+		-a|--address)
+			# if starts with colon, prefix with default 7767 prefix
+			opts_vpn_address="$2"
+			case "$opts_vpn_address" in
+				:*) opts_vpn_address="$DEFAULT_VPN_PREFIX$opts_vpn_address"
+			esac
 			
-			case "$address" in
-				*\$*)
-					relay_ip="${address%\$*}"
-					relay_cost="${address#*\$}"
-					
-					if [ -z "$relay_cost" ]
-					then
-						# default relay cost, if no number is indicated at the end, is zero
-						relay_cost="0"
-					fi
-					sock_send "Address = ${relay_ip}\$$((relay_cost + 1))"
-				;;
+			# if does not have a mask, assume based on colon count given where trailing ::* is removed
+			case "$opts_vpn_address" in
+				*/*) ;;
 				*)
-					sock_send "Address = ${address}\$1"
+					# if partial prefix address, then add :: at the end
+					if ! is_ipv6 "$opts_vpn_address"
+					then
+						opts_vpn_address="${opts_vpn_address%%:}"
+						opts_vpn_address="$opts_vpn_address::"
+					fi
+					
+					# count hex digits to automatically determine the subnet mask, using :: as a separator between the server's Interface ID and the subnet mask
+					read -r hexdigits < <(expand_ipv6 "${opts_vpn_address%%::*}")
+					read -r hexdigits < <(sed -r -e 's/://g' -e 's/0+$//g' <<<"$hexdigits")
+					opts_vpn_address="$opts_vpn_address/$((4 * ${#hexdigits}))"
 				;;
 			esac
 			
-		done < <("$0" -i "$opts_interface" conf list-servers AllowedIPs)
-		
-		# client exists, show all configuration entries of this client:
-		# this is mostly useful for the client so that it may read AllowedIPs and set it as its [Interface]'s Address
-		# note on security: anyone who knows a client's identifier can discover their IP-address, public key, and potentially other properties
-		
-		[ "$opts_verbosity" -ge 1 ] && echo "info: Remote[$remote_PublicKey]: Sending Peer-block to remote peer." >&2
-		
-		while read -r line
-		do
-			sock_send "$line"
+			# if ends with : or ::, then set to end with ::1 (::0 is considered invalid, bad practice to use this, reserved for special meaning)
+			case "$opts_vpn_address" in
+				*:/*) opts_vpn_address="${opts_vpn_address/:\//:1\/}"
+			esac
 			
-		done < <("$0" -i "$opts_interface" conf get-peer "$remote_PublicKey")
-	else
-		echo "error: Invalid server command ($opts_command)." >&2
-		exit 1
-	fi
-elif [ -z "$opts_context" ]
-then
-	print_usage
-else
-	echo "error: Invalid context command ($opts_context)." >&2
-	echo "For usage, see: $0 --help" >&2
-	exit 1
-fi
+			# check if argument is a valid IPv6-address
+			if ! is_ipv6 "$opts_vpn_address"
+			then
+				echo "error: Invalid usage. The address argument (-a) expects a valid IPv6-address (deduced $opts_vpn_address from $2)."
+				exit 1
+			fi
+			
+			[ "$opts_verbosity" -lt 1 ] || echo "debug: Parsed address argument: $opts_vpn_address"
+			
+			shift
+		;;
+		-k|--keepalive)
+			opts_persistent_keepalive_s="$2"
+			shift
+		;;
+		-b|--bind)
+			opts_bind_host="$2"
+			shift
+		;;
+		-m|--mac-address)
+			case "$2" in
+				*[^0-9a-f:-]*|"") ;; # if empty, or contains illegal MAC-address character (also allow dashes for hexadecimal uuid's)
+				*)
+					opts_mac_address="$2"
+					shift
+				;;
+			esac
+		;;
+		-p|--prefix-mask)
+			opts_prefix_mask="${2#*/}"
+			shift
+		;;
+		-s|--subnet-mask)
+			opts_subnet_mask="${2#*/}"
+			shift
+		;;
+		--masquerade)
+			opts_masquerade_interface="$2"
+			shift
+		;;
+		--no-masquerade)
+			opts_no_masquerade=true
+		;;
+		-v|-vv)
+			opts_verbosity=$((opts_verbosity + ${#1} - 1))
+		;;
+		-h|--help)
+			print_usage "$2"
+			exit
+		;;
+		-*)
+			echo "error: Invalid option ($1)."
+			print_usage "$opts_context"
+			exit 1
+		;;
+		*)
+			if [ -z "$opts_context" ]
+			then
+				opts_context="$1"
+			else
+				break
+			fi
+		;;
+	esac
+	
+	shift || break
+done
+
+case "$opts_context" in
+	help)
+		print_usage
+	;;
+	conf)
+		context_conf "$@"
+	;;
+	client)
+		context_client "$@"
+	;;
+	server)
+		context_server "$@"
+	;;
+	find)
+		context_find "$@"
+	;;
+	up|update|down)
+		context_wg "$opts_context" "$@"
+	;;
+	*)
+		wg "$opts_context" "$@"
+	;;
+esac
