@@ -3,16 +3,17 @@
 # note: Origin of default prefix: Wireguard = 'w' = [119] = [0x77] = fd77:: (fd/8 is required as a private/local IPv6-range prefix)
 # note: The server exposes a TCP-socket at the same port as as wireguard (which is listening to UDP), due to the different protocol, these ports are not in conflict
 # note: The wg-autoconf non-standard configuration is stored in /etc/wireguard/<interface>.autoconf, the derived configuration for Wireguard is in /etc/wireguard/<interface>.conf
-# note: It is highly recommended to change the Wireguard port from 51820 to a non-ephemeral port, since another process may already use this port, which results in a higher chance of conflict. For example, use port 5182 instead, or 7767 (which is hexadecimal for 'wg').
-
-# TODO: add support for MASQUERADE, make it working for IPv6 traffic first, set MasqueradeDevice as an entry of the Interface to remember the link device through which clients can connect (use a manual setup first, possibly with wg-quick)
-# TODO: also apply rules for iptables (to support IPv4 traffic for masquerading)
-# TODO: make wg-monitor that checks tunnel periodically (not as a keepalive), and automatically runs connect again (which also updates DNS to fetch new IP-address for Endpoints)
-
+# note: It is highly recommended to change the Wireguard port from 51820 to a non-ephemeral port, since another process may already use this port, which results in a higher chance of conflict. For example, use port 5182 or 5177 instead, or fd77.
 # note: Wireguard is dual-stack by default.
+
+# TODO: make wg-monitor that checks tunnel periodically (not as a keepalive), and automatically runs connect again (which also updates DNS to fetch new IP-address for Endpoints)
+# TODO: make separate wg utility that enables easy setup for MASQUERADE VPN usage (which does ipv4/ipv6 dual stack configuration)
 
 # default port as per Wireguard docs
 WIREGUARD_PORT="51820"
+
+# timeout for socket connections, where we're waiting for data
+PROTOCOL_TIMEOUT_S="20"
 
 # metrics to use for routes that are direct vs relayed routes
 # relay metric must be higher than server metric
@@ -33,7 +34,6 @@ DEFAULT_PREFIX_MASK="16"
 DEFAULT_SUBNET_MASK="48"
 DEFAULT_BIND_HOST="::"
 DEFAULT_PERSISTENT_KEEPALIVE_S="25"
-
 
 expand_ipv6()
 {
@@ -294,7 +294,7 @@ is_http()
 	esac
 	
 	# do a HEAD request to check if we're dealing with a webserver
-	read __is_http_res _ < <(sed -r -e 's/([^\r]|^)$/\1\r/' <<EOF | socat -t20 - tcp:"$__is_http_host":"$__is_http_port"
+	read __is_http_res _ < <(sed -r -e 's/([^\r]|^)$/\1\r/' <<EOF | socat -t"$PROTOCOL_TIMEOUT_S" - tcp:"$__is_http_host":"$__is_http_port"
 HEAD / HTTP/1.1
 Host: $__is_http_host
 User-Agent: wg-autoconf/1.0
@@ -407,14 +407,14 @@ print_usage()
 		echo "      server. If the local public key is authorized by the remote server, the"
 		echo "      remote server will append a Peer-section with this local server as its"
 		echo "      endpoint."
-		echo "      Port defaults to 51820."
+		echo "      Port defaults to $WIREGUARD_PORT."
 		echo ""
 		echo "  server listen [port]"
 		echo ""
 		echo "      Listen at the given TCP-port."
 		echo "      Any remote clients and servers can connect, and if authorized, be added"
 		echo "      to the subnet that this server provides."
-		echo "      Port defaults to 51820."
+		echo "      Port defaults to $WIREGUARD_PORT."
 		echo ""
 		echo "  server allow <public-key> [Type=<server|client>]"
 		echo ""
@@ -470,7 +470,7 @@ print_usage()
 		echo "      will be completely overwritten. Do NOT run as server, since all"
 		echo "      existing clients will be disconnected, and manual configuration changes"
 		echo "      will be deleted."
-		echo "      Port defaults to 51820."
+		echo "      Port defaults to $WIREGUARD_PORT."
 		echo ""
 		echo ""
 		echo "CLIENT CONNECT OPTIONS"
@@ -615,17 +615,9 @@ context_wg()
 			cmd ip6tables -F "$chain"_FW
 			cmd ip6tables -X "$chain"_FW
 			
-			cmd ip6tables -D "$chain"_FW -j "$chain"_FW_MASQ
-			cmd ip6tables -F "$chain"_FW_MASQ
-			cmd ip6tables -X "$chain"_FW_MASQ
-			
 			cmd ip6tables -D "$chain"_FW -p udp -j "$chain"_FW_ALLOW
 			cmd ip6tables -F "$chain"_FW_ALLOW
 			cmd ip6tables -X "$chain"_FW_ALLOW
-			
-			cmd ip6tables -t nat -D POSTROUTING -j "$chain"_MASQ
-			cmd ip6tables -t nat -F "$chain"_MASQ
-			cmd ip6tables -t nat -X "$chain"_MASQ
 		;;
 		up|update)
 			# exit on any failure
@@ -684,21 +676,8 @@ context_wg()
 				cmd ip6tables -I "$chain"_FW 3 -p udp -j "$chain"_FW_ALLOW
 			fi
 			
-			if cmd ip6tables -N "$chain"_FW_MASQ
-			then
-				# there are 3 rules in "$chain"_FW, add before the DROP
-				cmd ip6tables -I "$chain"_FW 3 -j "$chain"_FW_MASQ
-			fi
-			
-			if cmd ip6tables -t nat -N "$chain"_MASQ
-			then
-				cmd ip6tables -t nat -I POSTROUTING -j "$chain"_MASQ
-			fi
-			
 			iptables_chain_in=0
 			iptables_chain_fw_allow=0
-			iptables_chain_fw_masq=0
-			iptables_chain_masq=0
 			
 			# only set interface up if "up" command, with "update", don't actually bring the interface up
 			if [ "$opts_command" = "up" ]
@@ -824,16 +803,6 @@ context_wg()
 				# keep track of maximum relay cost
 				[ "$relay_cost" -le "$max_relay_cost" ] || max_relay_cost="$relay_cost"
 				
-				# check if IPv4 address (to catch as masquerade)
-				#case "$address" in
-				#	*.*.*.*)
-				#		ensure_ip4route "${address%\$*}" dev "$opts_interface" metric "$((RELAY_METRIC_FACTOR * relay_cost + LOCAL_METRIC))"
-				#		
-				#		# skip the rest
-				#		continue
-				#	;;
-				#esac
-				
 				# grab the mask, and ensure any traffic directed at this prefix is routed to the wireguard link
 				ensure_ip6route "${address%\$*}" dev "$opts_interface" metric "$((RELAY_METRIC_FACTOR * relay_cost + LOCAL_METRIC))"
 				
@@ -929,55 +898,6 @@ context_wg()
 				done
 			fi
 			
-			if [ -z "$opts_masquerade_interface" ]
-			then
-				# grab masquerade interface from configuration
-				read -r opts_masquerade_interface < <("$0" conf get-interface MasqueradeInterface) || true
-			fi
-			
-			echo "info: Masquerading to link device ($opts_masquerade_interface)."
-			
-			# if masquerading is allowed
-			if [ -n "$opts_masquerade_interface" ]
-			then
-				# allow traffic from the masq interface back into the tunnel
-				cmd ip6tables -I "$chain"_FW_MASQ 1 -i "$opts_masquerade_interface" -o "$opts_interface" -j ACCEPT
-				((++iptables_chain_fw_masq))
-				
-				while read -r allowed_ip
-				do
-					[ -n "$allowed_ip" ] || continue
-					
-					# because of -I, the order here is reversed, so first add the passthrough chain rule
-					
-					echo "info: Masquerading is allowed for client with AllowedIPs: $allowed_ip"
-					
-					# masquerade any leftover non-virtual traffic in the POSTROUTING chain to the given interface
-					cmd ip6tables -t nat -I "$chain"_MASQ 1 -s "$allowed_ip" -o "$opts_masquerade_interface" -j MASQUERADE
-					((++iptables_chain_masq))
-					
-					# and now add RETURN rules, in case the traffic is intended for the virtual network
-					for prefix in "${prefixes[@]}"
-					do
-						read -r addr < <(hex_to_expanded_ipv6 "${prefix:0:$((opts_prefix_mask / 4))}")
-						
-						# don't masquerade if traffic from this allowed ip goes to a virtual address prefix
-						cmd ip6tables -t nat -I "$chain"_MASQ 1 -s "$allowed_ip" -d "$addr/$opts_prefix_mask" -o "$opts_masquerade_interface" -j RETURN
-						((++iptables_chain_masq))
-					done
-					
-					# specifically allow any traffic from the wireguard tunnel from that address, to be accepted into the target interface
-					cmd ip6tables -I "$chain"_FW_ALLOW 1 -s "$allowed_ip" -o "$opts_masquerade_interface" -j ACCEPT
-					((++iptables_chain_fw_allow))
-					
-				done < <("$0" -i "$opts_interface" conf list-clients AllowedIPs)
-				
-				# any other traffic that was not matched will automatically be dropped, unless whitelisted by $chain_allow
-				
-				# so that allows anything coming in on the masq interface? but that's weird...
-				# also allow INPUT for: ip6tables -I INPUT -i "$opts_masquerade_interface" -p udp --dport LISTEN_PORT -j ACCEPT
-			fi
-			
 			# clients must always be part of a subnet of a server, so no routing rules required for those
 			# because the server should already have a mask
 			
@@ -993,14 +913,6 @@ context_wg()
 			while cmd ip6tables -D "$chain"_FW_ALLOW "$((iptables_chain_fw_allow + 1))"
 			do
 				echo "info: Removed old rule from ${chain}_FW_ALLOW"
-			done
-			while cmd ip6tables -D "$chain"_FW_MASQ "$((iptables_chain_fw_masq + 1))"
-			do
-				echo "info: Removed old rule from ${chain}_FW_MASQ."
-			done
-			while cmd ip6tables -t nat -D "$chain"_MASQ "$((iptables_chain_masq + 1))"
-			do
-				echo "info: Removed old rule from ${chain}_MASQ."
 			done
 			
 			"$0" show "$opts_interface"
@@ -1060,14 +972,12 @@ context_conf()
 		interface_Endpoint=""
 		interface_InterfaceID=""
 		interface_SubnetMask=""
-		interface_MasqueradeInterface=""
 		
 		peer_PublicKey=""
 		peer_Endpoint=""
 		peer_AllowedIPs=()
 		peer_PersistentKeepalive=""
 		peer_Type=""
-		peer_Masquerade=""
 		
 		section_buffer=()
 		section=""
@@ -1111,7 +1021,6 @@ context_conf()
 				done
 			fi
 			[ -z "$peer_PersistentKeepalive" ] || echo "PersistentKeepalive = $peer_PersistentKeepalive"
-			[ -z "$peer_Masquerade" ] || echo "Masquerade = $peer_Masquerade"
 		fi
 		
 		if [ "${#section_buffer[@]}" -gt 0 ]
@@ -1198,11 +1107,6 @@ context_conf()
 					# the IPv6-address we chose
 					[ -z "$peer_Endpoint" ] || echo "$peer_Endpoint"
 				
-				elif [ "$1" = "Masquerade" ]
-				then
-					# the DNS-record the server supplied for its mesh network
-					[ -z "$peer_Masquerade" ] || echo "$peer_Masquerade"
-					
 				elif [ -n "$1" ]
 				then
 					return 1
@@ -1242,9 +1146,6 @@ context_conf()
 						;;
 						SubnetMask)
 							[ -z "$interface_SubnetMask" ] || echo "$interface_SubnetMask"
-						;;
-						MasqueradeInterface)
-							[ -z "$interface_MasqueradeInterface" ] || echo "$interface_MasqueradeInterface"
 						;;
 						'')
 							print_section_buffer
@@ -1287,9 +1188,6 @@ context_conf()
 					;;
 					Type)
 						[ -z "$peer_Type" ] || echo "$peer_Type"
-					;;
-					Masquerade)
-						[ -z "$peer_Masquerade" ] || echo "$peer_Masquerade"
 					;;
 					'')
 						print_section_buffer
@@ -1380,7 +1278,6 @@ context_conf()
 					new_peer_Endpoint=""
 					new_peer_AllowedIPs=()
 					new_peer_PersistentKeepalive=""
-					new_peer_Masquerade=""
 					
 					# you can use stdin or cli-args to set key&value pairs, but these methods cannot be mixed (enforce strict style consistency, to avoid bugs due to using undefined behavior if they are mixed and the implementation changes)
 					if [ "$#" -gt 1 ]
@@ -1434,9 +1331,6 @@ context_conf()
 											subnetmask)
 												read -r interface_SubnetMask <<<"$value"
 											;;
-											masqueradeinterface)
-												read -r interface_MasqueradeInterface <<<"$value"
-											;;
 										esac
 									;;
 									Peer)
@@ -1458,10 +1352,6 @@ context_conf()
 											persistentkeepalive)
 												set_peer_PersistentKeepalive=true
 												read -r new_peer_PersistentKeepalive <<<"$value"
-											;;
-											masquerade)
-												set_peer_Masquerade=true
-												read -r new_peer_Masquerade <<<"$value"
 											;;
 										esac
 									;;
@@ -1507,9 +1397,6 @@ context_conf()
 										SubnetMask=*)
 											read -r interface_SubnetMask <<<"${stdin_line#*=}"
 										;;
-										MasqueradeInterface=*)
-											read -r interface_MasqueradeInterface <<<"${stdin_line#*=}"
-										;;
 									esac
 								;;
 								Peer)
@@ -1531,10 +1418,6 @@ context_conf()
 										PersistentKeepalive=*)
 											set_peer_PersistentKeepalive=true
 											read -r new_peer_PersistentKeepalive <<<"${stdin_line#*=}"
-										;;
-										Masquerade=*)
-											set_peer_Masquerade=true
-											read -r new_peer_Masquerade <<<"${stdin_line#*=}"
 										;;
 									esac
 								;;
@@ -1598,10 +1481,6 @@ context_conf()
 						else
 							peer_PersistentKeepalive="$new_peer_PersistentKeepalive"
 						fi
-					fi
-					if $set_peer_Masquerade
-					then
-						peer_Masquerade="$new_peer_Masquerade"
 					fi
 				fi
 				
@@ -1729,10 +1608,6 @@ context_conf()
 							parsed=true
 							read -r interface_SubnetMask <<<"${line#*=}"
 						;;
-						MasqueradeInterface=*)
-							parsed=true
-							read -r interface_MasqueradeInterface <<<"${line#*=}"
-						;;
 					esac
 				;;
 				Peer)
@@ -1756,10 +1631,6 @@ context_conf()
 						PersistentKeepalive=*)
 							parsed=true
 							read -r peer_PersistentKeepalive <<<"${line#*=}"
-						;;
-						Masquerade=*)
-							parsed=true
-							read -r peer_Masquerade <<<"${line#*=}"
 						;;
 					esac
 				;;
@@ -1900,12 +1771,11 @@ EOF
 			remote_Endpoint=""
 			
 			client_Address=""
-			client_Masquerade=()
 			
-			conn_cmd=(socat -t20 - tcp:"$connect_host":"$connect_port")
+			conn_cmd=(socat -t"$PROTOCOL_TIMEOUT_S" - tcp:"$connect_host":"$connect_port")
 			if is_http "$connect_host" "$connect_port"
 			then
-				conn_cmd=(curl --data-binary @- --insecure --max-time 20 -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:$connect_port/.well-known/wg-autoconf/")
+				conn_cmd=(curl --data-binary @- --insecure --max-time "$PROTOCOL_TIMEOUT_S" -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:$connect_port/.well-known/wg-autoconf/")
 			fi
 			
 			section=""
@@ -1951,10 +1821,6 @@ EOF
 						case "${line// /}" in
 							AllowedIPs=*)
 								read -r client_Address <<<"${line#*=}"
-							;;
-							Masquerade=*)
-								# the IP-addresses that the client is allowed to masquerade, by default the server configures the client, unless the client uses --no-masquerade with connect
-								split ',' "${line#*=}" client_Masquerade
 							;;
 						esac
 					;;
@@ -2012,9 +1878,6 @@ EOF
 			# combine remote_Address to one line:
 			read -r remote_AddressLine < <(join ', ' "${remote_Address[@]}")
 			
-			# combine client_Masquerade to one line:
-			read -r client_MasqueradeLine < <(join ', ' "${client_Masquerade[@]}")
-			
 			echo "info: Configuration received from server ($remote_PublicKey)."
 			
 			echo "info: Client address: $client_Address"
@@ -2022,17 +1885,6 @@ EOF
 			[ -z "$remote_AddressLine" ] || echo "info: Server virtual addresses: $remote_AddressLine"
 			
 			echo "info: Server is reachable at: $remote_Endpoint"
-			
-			[ -z "$client_MasqueradeLine" ] || echo "info: Server allows Masquerade for the following IP's: $client_MasqueradeLine"
-			
-			# if a client wants to enable routing all internet, they just need to set AllowedIPs of that server to: 0.0.0.0/0, ::/0, the server will set MASQUERADE if the server allows it
-			# a client can only reject this option to masquerade traffic, by passing --no-masquerade
-			if $opts_no_masquerade || [ -z "$client_MasqueradeLine" ]
-			then
-				server_AllowedIPs="$remote_AddressLine"
-			else
-				read -r server_AllowedIPs < <(join ', ' "${remote_Address[@]}" "${client_Masquerade}")
-			fi
 			
 			if ! "$0" -i "$opts_interface" conf set-interface <<EOF
 Address = $client_Address
@@ -2043,7 +1895,7 @@ EOF
 			fi
 			if ! "$0" -i "$opts_interface" conf set-peer "$remote_PublicKey" <<EOF
 Type = server
-AllowedIPs = $server_AllowedIPs
+AllowedIPs = $remote_AddressLine
 Endpoint = $remote_Endpoint
 PersistentKeepalive = $opts_persistent_keepalive_s
 EOF
@@ -2252,10 +2104,10 @@ EOF
 			
 			assigned_Address=()
 			
-			conn_cmd=(socat -t20 - tcp:"$connect_host":"$connect_port")
+			conn_cmd=(socat -t"$PROTOCOL_TIMEOUT_S" - tcp:"$connect_host":"$connect_port")
 			if is_http "$connect_host" "$connect_port"
 			then
-				conn_cmd=(curl --data-binary @- --insecure --max-time 20 -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:$connect_port/.well-known/wg-autoconf/")
+				conn_cmd=(curl --data-binary @- --insecure --max-time "$PROTOCOL_TIMEOUT_S" -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:$connect_port/.well-known/wg-autoconf/")
 			fi
 			
 			section=""
@@ -2417,13 +2269,7 @@ EOF
 				fi
 			fi
 			
-			# pass masquerade on here TODO: replace with updating Interface section with our Masquerade link-device, for instance: MasqueradeDevice = ens3
-			cmd=("$0")
-			if [ -n "$opts_masquerade_interface" ]
-			then
-				cmd+=("--masquerade" "$opts_masquerade_interface")
-			fi
-			"${cmd[@]}" up "$opts_interface"
+			"$0" up "$opts_interface"
 			
 			echo "Listening on $opts_bind_host:$local_ListenPort with public key: $local_PublicKey"
 			
@@ -2466,7 +2312,7 @@ EOF
 			remote_Endpoint=""       # how to reach this server from outside (optional, but sort of mandatory if server, otherwise the connection is only half)
 			set_remote_Endpoint=false
 			
-			while read -t 20 -r line
+			while read -t "$PROTOCOL_TIMEOUT_S" -r line
 			do
 				sock_receive "$line"
 				
@@ -3012,8 +2858,6 @@ opts_persistent_keepalive_s="$DEFAULT_PERSISTENT_KEEPALIVE_S"
 opts_mac_address=""
 opts_prefix_mask="$DEFAULT_PREFIX_MASK"
 opts_subnet_mask="$DEFAULT_SUBNET_MASK"
-opts_masquerade_interface=""
-opts_no_masquerade=false
 
 while [ "$#" -gt 0 ]
 do
@@ -3027,7 +2871,7 @@ do
 			shift
 		;;
 		-a|--address)
-			# if starts with colon, prefix with default 7767 prefix
+			# if starts with colon, prefix with default fd77 prefix
 			opts_vpn_address="$2"
 			case "$opts_vpn_address" in
 				:*) opts_vpn_address="$DEFAULT_VPN_PREFIX$opts_vpn_address"
@@ -3091,13 +2935,6 @@ do
 		-s|--subnet-mask)
 			opts_subnet_mask="${2#*/}"
 			shift
-		;;
-		--masquerade)
-			opts_masquerade_interface="$2"
-			shift
-		;;
-		--no-masquerade)
-			opts_no_masquerade=true
 		;;
 		-v|-vv)
 			opts_verbosity=$((opts_verbosity + ${#1} - 1))
