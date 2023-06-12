@@ -718,6 +718,10 @@ context_wg()
 				insert_ip6tables_listenport
 			fi
 			
+			# grab the configured SubnetMask
+			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask)
+			[ -n "$local_SubnetMask" ] || local_SubnetMask="$DEFAULT_SUBNET_MASK"
+			
 			# gather prefixes, for ip6tables rules later on
 			prefixes=()
 			
@@ -765,7 +769,7 @@ context_wg()
 					*/*)
 						# only add if the prefix mask is less than the subnet mask
 						prefix_mask="${address#*/}"
-						if [ "$prefix_mask" -lt "$opts_subnet_mask" ]
+						if [ "$prefix_mask" -lt "$local_SubnetMask" ]
 						then
 							read -r prefix < <(expand_ipv6 "$address" | tr -d ':')
 							prefixes+=("${prefix:0:$(($prefix_mask/4))}")
@@ -783,7 +787,7 @@ context_wg()
 			max_relay_cost="0"
 			
 			# one IP per line, multiple lines may belong to one peer
-			while read -r address
+			while read -r pubkey address
 			do
 				[ -n "$address" ] || continue
 				
@@ -823,7 +827,7 @@ context_wg()
 						# only add if the prefix mask is less than the subnet mask
 						prefix_mask="${address#*/}"
 						prefix_mask="${prefix_mask%\$*}"
-						if [ "$prefix_mask" -lt "$opts_subnet_mask" ]
+						if [ "$prefix_mask" -lt "$local_SubnetMask" ]
 						then
 							read -r prefix < <(expand_ipv6 "${address%\$*}" | tr -d ':')
 							prefixes+=("${prefix:0:$(($prefix_mask/4))}")
@@ -847,7 +851,7 @@ context_wg()
 			echo "allowing anyone to access this client from same subnet"
 			
 			# allow anyone to access this incoming client, as long as they are from the same subnet
-			while read -r allowed_ip
+			while read -r pubkey allowed_ip
 			do
 				[ -n "$allowed_ip" ] || continue
 				
@@ -858,7 +862,7 @@ context_wg()
 				read -r addr < <(expand_ipv6 "$addr" | tr -d ':')
 				
 				# extract the first N digits, i.e. for 48-bit that is 12 digits
-				addr="${addr:0:$(($opts_subnet_mask/4))}"
+				addr="${addr:0:$(($local_SubnetMask/4))}"
 				
 				subnet_prefix="$addr"
 				
@@ -866,7 +870,7 @@ context_wg()
 				read -r addr < <(hex_to_expanded_ipv6 "$addr")
 				
 				# add a mask
-				addr="$addr/$opts_subnet_mask"
+				addr="$addr/$local_SubnetMask"
 				
 				# recompress expanded IPv6-address (this also adds a trailing ::)
 				# local group addr is now a subnet group with its appropriate subnet mask
@@ -880,7 +884,7 @@ context_wg()
 					read -r addr < <(hex_to_expanded_ipv6 "$prefix${subnet_prefix:${#prefix}}")
 					
 					# compress_ipv6 also adds :: at the end, and preserves mask
-					read -r group_addr < <(compress_ipv6 "$addr/$opts_subnet_mask")
+					read -r group_addr < <(compress_ipv6 "$addr/$local_SubnetMask")
 					
 					# allow where: group_addr is the source, local_group_addr is the destination
 					groups+=("$group_addr" "$local_group_addr")
@@ -986,20 +990,20 @@ context_conf()
 	{
 		if [ "$section" = "Interface" ]
 		then
-			echo "[Interface]"
+			printf '%s\n' "[Interface]"
 			
-			[ -z "$interface_PrivateKey" ] || echo "PrivateKey = $interface_PrivateKey"
+			[ -z "$interface_PrivateKey" ] || printf '%s\n' "PrivateKey = $interface_PrivateKey"
 			if [ "${#interface_Address[@]}" -gt 0 ]
 			then
 				for address in "${interface_Address[@]}"
 				do
-					echo "Address = $address"
+					printf '%s\n' "Address = $address"
 				done
 			fi
-			[ -z "$interface_ListenPort" ] || echo "ListenPort = $interface_ListenPort"
-			[ -z "$interface_Endpoint" ] || echo "Endpoint = $interface_Endpoint"
-			[ -z "$interface_InterfaceID" ] || echo "InterfaceID = $interface_InterfaceID"
-			[ -z "$interface_SubnetMask" ] || echo "SubnetMask = $interface_SubnetMask"
+			[ -z "$interface_ListenPort" ] || printf '%s\n' "ListenPort = $interface_ListenPort"
+			[ -z "$interface_Endpoint" ] || printf '%s\n' "Endpoint = $interface_Endpoint"
+			[ -z "$interface_InterfaceID" ] || printf '%s\n' "InterfaceID = $interface_InterfaceID"
+			[ -z "$interface_SubnetMask" ] || printf '%s\n' "SubnetMask = $interface_SubnetMask"
 			
 		elif [ "$section" = "Peer" ]
 		then
@@ -1009,25 +1013,25 @@ context_conf()
 				return 1
 			fi
 			
-			echo "[Peer]"
-			[ -z "$peer_Type" ] || echo "Type = $peer_Type"
-			[ -z "$peer_PublicKey" ] || echo "PublicKey = $peer_PublicKey"
-			[ -z "$peer_Endpoint" ] || echo "Endpoint = $peer_Endpoint"
+			printf '%s\n' "[Peer]"
+			[ -z "$peer_Type" ] || printf '%s\n' "Type = $peer_Type"
+			[ -z "$peer_PublicKey" ] || printf '%s\n' "PublicKey = $peer_PublicKey"
+			[ -z "$peer_Endpoint" ] || printf '%s\n' "Endpoint = $peer_Endpoint"
 			if [ "${#peer_AllowedIPs[@]}" -gt 0 ]
 			then
 				for allowed_ip in "${peer_AllowedIPs[@]}"
 				do
-					echo "AllowedIPs = $allowed_ip"
+					printf '%s\n' "AllowedIPs = $allowed_ip"
 				done
 			fi
-			[ -z "$peer_PersistentKeepalive" ] || echo "PersistentKeepalive = $peer_PersistentKeepalive"
+			[ -z "$peer_PersistentKeepalive" ] || printf '%s\n' "PersistentKeepalive = $peer_PersistentKeepalive"
 		fi
 		
 		if [ "${#section_buffer[@]}" -gt 0 ]
 		then
 			for section_line in "${section_buffer[@]}"
 			do
-				echo "$section_line"
+				printf '%s\n' "$section_line"
 			done
 		fi
 		
@@ -1093,19 +1097,26 @@ context_conf()
 				
 				if [ "$1" = "PublicKey" ]
 				then
-					[ -z "$peer_PublicKey" ] || echo "$peer_PublicKey"
+					[ -z "$peer_PublicKey" ] || printf '%s\n' "$peer_PublicKey"
 					
 				elif [ "$1" = "AllowedIPs" ]
 				then
 					for allowed_ip in "${peer_AllowedIPs[@]}"
 					do
-						echo "$allowed_ip"
+						[ -z "$allowed_ip" ] || printf '%s\t%s\n' "$peer_PublicKey" "$allowed_ip"
 					done
 				
 				elif [ "$1" = "Endpoint" ]
 				then
-					# the IPv6-address we chose
-					[ -z "$peer_Endpoint" ] || echo "$peer_Endpoint"
+					[ -z "$peer_Endpoint" ] || printf '%s\t%s\n' "$peer_PublicKey" "$peer_Endpoint"
+				
+				elif [ "$1" = "Type" ]
+				then
+					[ -z "$peer_Type" ] || printf '%s\t%s\n' "$peer_PublicKey" "$peer_Type"
+				
+				elif [ "$1" = "PersistentKeepalive" ]
+				then
+					[ -z "$peer_PersistentKeepalive" ] || printf '%s\t%s\n' "$peer_PublicKey" "$peer_PersistentKeepalive"
 				
 				elif [ -n "$1" ]
 				then
@@ -1129,23 +1140,23 @@ context_conf()
 						Address)
 							for address in "${interface_Address[@]}"
 							do
-								echo "$address"
+								printf '%s\n' "$address"
 							done
 						;;
 						PrivateKey)
-							[ -z "$interface_PrivateKey" ] || echo "$interface_PrivateKey"
+							[ -z "$interface_PrivateKey" ] || printf '%s\n' "$interface_PrivateKey"
 						;;
 						ListenPort)
-							[ -z "$interface_ListenPort" ] || echo "$interface_ListenPort"
+							[ -z "$interface_ListenPort" ] || printf '%s\n' "$interface_ListenPort"
 						;;
 						Endpoint)
-							[ -z "$interface_Endpoint" ] || echo "$interface_Endpoint"
+							[ -z "$interface_Endpoint" ] || printf '%s\n' "$interface_Endpoint"
 						;;
 						InterfaceID)
-							[ -z "$interface_InterfaceID" ] || echo "$interface_InterfaceID"
+							[ -z "$interface_InterfaceID" ] || printf '%s\n' "$interface_InterfaceID"
 						;;
 						SubnetMask)
-							[ -z "$interface_SubnetMask" ] || echo "$interface_SubnetMask"
+							[ -z "$interface_SubnetMask" ] || printf '%s\n' "$interface_SubnetMask"
 						;;
 						'')
 							print_section_buffer
@@ -1161,7 +1172,7 @@ context_conf()
 				if ! $section_matched && [ -z "$1" ]
 				then
 					# print empty Interface, by default, if non-existing Interface section
-					echo "[Interface]"
+					printf '%s\n' "[Interface]"
 				fi
 			}
 		;;
@@ -1172,22 +1183,22 @@ context_conf()
 			{
 				case "$1" in
 					PublicKey)
-						[ -z "$peer_PublicKey" ] || echo echo "$peer_PublicKey"
+						[ -z "$peer_PublicKey" ] || printf '%s\n' "$peer_PublicKey"
 					;;
 					AllowedIPs)
 						for allowed_ip in "${peer_AllowedIPs[@]}"
 						do
-							echo "$allowed_ip"
+							printf '%s\n' "$allowed_ip"
 						done
 					;;
 					PersistentKeepalive)
-						[ -z "$peer_PersistentKeepalive" ] || echo echo "$peer_PersistentKeepalive"
+						[ -z "$peer_PersistentKeepalive" ] || printf '%s\n' "$peer_PersistentKeepalive"
 					;;
 					Endpoint)
-						[ -z "$peer_Endpoint" ] || echo "$peer_Endpoint"
+						[ -z "$peer_Endpoint" ] || printf '%s\n' "$peer_Endpoint"
 					;;
 					Type)
-						[ -z "$peer_Type" ] || echo "$peer_Type"
+						[ -z "$peer_Type" ] || printf '%s\n' "$peer_Type"
 					;;
 					'')
 						print_section_buffer
@@ -2015,10 +2026,8 @@ EOF
 	[ -n "$local_ListenPort" ] || read -r local_ListenPort < <("$0" show "$opts_interface" listen-port)
 	[ -n "$local_ListenPort" ] || local_ListenPort="$WIREGUARD_PORT"
 	
-	
 	# grab local_Endpoint
 	read -r local_Endpoint < <("$0" -i "$opts_interface" conf get-interface Endpoint)
-	
 	
 	# fallback to current hostname (this is probably the best default behavior that should not be stored in the configuration file explicitly unless done so manually)
 	[ -n "$local_Endpoint" ] || read -r local_Endpoint < <(hostname)
@@ -2050,7 +2059,7 @@ EOF
 			# add AllowedIPs from servers open for relay to local_Address, but with an increased cost
 			
 			# one IP per line, multiple lines may belong to one peer
-			while read -r address
+			while read -r pubkey address
 			do
 				[ -n "$address" ] || continue
 				
@@ -2269,6 +2278,22 @@ EOF
 				fi
 			fi
 			
+			# grab local_SubnetMask
+			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask)
+			[ -n "$local_SubnetMask" ] || local_SubnetMask="$DEFAULT_SUBNET_MASK"
+			
+			if [ -n "$opts_subnet_mask" ] && [ "$opts_subnet_mask" != "$local_SubnetMask" ]
+			then
+				# specified a custom SubnetMask in the configuration
+				local_SubnetMask="$opts_subnet_mask"
+				
+				echo "info: Updating SubnetMask in Interface-section."
+				
+				"$0" -i "$opts_interface" conf set-interface <<EOF
+SubnetMask = $local_SubnetMask
+EOF
+			fi
+			
 			"$0" up "$opts_interface"
 			
 			echo "Listening on $opts_bind_host:$local_ListenPort with public key: $local_PublicKey"
@@ -2356,6 +2381,7 @@ EOF
 			
 			# grab the latest known SubnetMask
 			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask)
+			[ -n "$local_SubnetMask" ] || local_SubnetMask="$DEFAULT_SUBNET_MASK"
 			
 			# get peer section
 			if ! peer_info="$("$0" -i "$opts_interface" conf get-peer "$remote_PublicKey")"
@@ -2692,7 +2718,7 @@ EOF
 			done
 			
 			# here we also want to print every Peer we relay for as our own Address, but with increased cost
-			while read -r address
+			while read -r pubkey address
 			do
 				[ -n "$address" ] || continue
 				
@@ -2857,7 +2883,7 @@ opts_bind_host="$DEFAULT_BIND_HOST"
 opts_persistent_keepalive_s="$DEFAULT_PERSISTENT_KEEPALIVE_S"
 opts_mac_address=""
 opts_prefix_mask="$DEFAULT_PREFIX_MASK"
-opts_subnet_mask="$DEFAULT_SUBNET_MASK"
+opts_subnet_mask=""
 
 while [ "$#" -gt 0 ]
 do
