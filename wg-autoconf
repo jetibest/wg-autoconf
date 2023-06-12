@@ -726,7 +726,7 @@ context_wg()
 			fi
 			
 			# grab the configured SubnetMask
-			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask)
+			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask) || true
 			[ -n "$local_SubnetMask" ] || local_SubnetMask="$DEFAULT_SUBNET_MASK"
 			
 			# gather prefixes, for ip6tables rules later on
@@ -2372,11 +2372,13 @@ ListenPort = $local_ListenPort
 EOF
 				then
 					local_ListenPort_configured=true
+				else
+					exit 1
 				fi
 			fi
 			
 			# grab local_SubnetMask
-			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask)
+			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask) || true
 			[ -n "$local_SubnetMask" ] || local_SubnetMask="$DEFAULT_SUBNET_MASK"
 			
 			if [ -n "$opts_subnet_mask" ] && [ "$opts_subnet_mask" != "$local_SubnetMask" ]
@@ -2477,7 +2479,7 @@ EOF
 			[ -z "$local_Endpoint" ] || interface_block+=("Endpoint = $local_Endpoint")
 			
 			# grab the latest known SubnetMask
-			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask)
+			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask) || true
 			[ -n "$local_SubnetMask" ] || local_SubnetMask="$DEFAULT_SUBNET_MASK"
 			
 			# get peer section
