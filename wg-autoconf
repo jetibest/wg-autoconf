@@ -1904,6 +1904,23 @@ EOF
 				echo "error: Failed to update configuration (set-interface)."
 				exit 1
 			fi
+			
+			# the client only has one target endpoint, by definition, this keeps the configuration file simple and small
+			# and automatically avoids conflicts with AllowedIPs (possibly with same prefix and potentially different masks)
+			# multiple connections should be possible though
+			while read -r cur_PublicKey
+			do
+				# unless the PublicKey is the same, because in that case, the configuration is to be overwritten already
+				if [ "$cur_PublicKey" != "$remote_PublicKey" ]
+				then
+					# delete any other existing server
+					echo "info: Removing peer ($cur_PublicKey) with configuration:"
+					"$0" -i "$opts_interface" conf get-peer "$cur_PublicKey"
+					"$0" -i "$opts_interface" conf remove-peer "$cur_PublicKey"
+				fi
+				
+			done < <("$0" -i "$opts_interface" conf list-servers PublicKey)
+			
 			if ! "$0" -i "$opts_interface" conf set-peer "$remote_PublicKey" <<EOF
 Type = server
 AllowedIPs = $remote_AddressLine
