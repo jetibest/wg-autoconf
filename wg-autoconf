@@ -6,7 +6,6 @@
 # note: It is highly recommended to change the Wireguard port from 51820 to a non-ephemeral port, since another process may already use this port, which results in a higher chance of conflict. For example, use port 5182 or 5177 instead, or fd77.
 # note: Wireguard is dual-stack by default.
 
-# TODO: make wg-monitor that checks tunnel periodically (not as a keepalive), and automatically runs connect again (which also updates DNS to fetch new IP-address for Endpoints)
 # TODO: make separate wg utility that enables easy setup for MASQUERADE VPN usage (which does ipv4/ipv6 dual stack configuration)
 
 # default port as per Wireguard docs
@@ -137,6 +136,14 @@ apply_ipv6_mask()
 is_ipv6()
 {
 	ip -6 route get "$1" >/dev/null 2>/dev/null || [ $? -ne 1 ]
+}
+is_ipv4()
+{
+	ip -4 route get "$1" >/dev/null 2>/dev/null || [ $? -ne 1 ]
+}
+is_hostname()
+{
+	! is_ipv4 && ! is_ipv6
 }
 is_mac_addr()
 {
@@ -1933,6 +1940,79 @@ EOF
 			fi
 			
 			"$0" up "$opts_interface"
+			
+			# keep script alive, while handshakes are going on, this could also just be a separate command:
+			# wg-autoconf client monitor
+			if [ "$opts_alive_count_max" -gt 0 ] && [ "$opts_persistent_keepalive_s" -gt 0 ]
+			then
+				resolved_endpoint=""
+				# strip port
+				remote_hostname="${remote_Endpoint%:*}"
+				# strip IPv6 brackets
+				remote_hostname="${remote_hostname#\[}"
+				remote_hostname="${remote_hostname%\]}"
+				
+				if is_hostname "$remote_hostname"
+				then
+					# get resolved IP-address
+					read -r resolved_endpoint < <("$0" show "$opts_interface" endpoints | awk '$1=="'"$remote_PublicKey"'"{print $2}')
+					
+					echo "info: Connected to resolved endpoint: $resolved_endpoint"
+					
+					# strip port
+					resolved_endpoint="${resolved_endpoint%:*}"
+					# strip IPv6 brackets
+					resolved_endpoint="${resolved_endpoint#\[}"
+					resolved_endpoint="${resolved_endpoint%\]}"
+				fi
+				
+				# note: Handshake is only done every once per 120 seconds (as per Wireguard protocol).
+				#       Therefore, if we allow 1 missed handshake, the minimum timeout with a PersistentKeepalive of 25 seconds, is 145 seconds (= 120 + 45).
+				#       Since we only check when the last handshake is, and we don't actually use the tunnel.
+				#       This is really a failsafe method to detect a bad connection, which catches any kind of connection loss, but takes a long time to detect.
+				#       If a server must be brought down, the correct procedure is to remove it from the DNS round robin first, which is detected here every PersistentKeepalive seconds.
+				#       However, DNS is also slow, it may take many minutes if not hours, to propagate such a change.
+				
+				# TODO: use a local BIND service with max-stale-ttl and stale-answer-enable options, for redundancy in case of nameserver downtime of the remote hostname Endpoint
+				
+				handshake_timeout_s="$((opts_alive_count_max * opts_persistent_keepalive_s + 120))"
+				
+				last_confirmed_handshake=""
+				while true
+				do
+					# if the remote Endpoint is a hostname,  check if it still resolves to the IP-address of the remote Endpoint
+					if [ -n "$resolved_endpoint" ] && ! getent hosts "$remote_hostname" | grep -F "$resolved_endpoint" >/dev/null 2>/dev/null
+					then
+						echo "error: Endpoint IP-address ($resolved_endpoint) is not listed by the DNS records of the remote hostname anymore ($remote_hostname)."
+						exit 78
+					fi
+					
+					# check last handshake connection
+					read -r last_handshake < <("$0" show "$opts_interface" latest-handshakes | awk '$1=="'"$remote_PublicKey"'"{print $2}')
+					read -r cur_time < <(date +'%s')
+					if [ -n "$last_handshake" ]
+					then
+						last_confirmed_handshake="$last_handshake"
+						
+					elif [ -z "$last_confirmed_handshake" ]
+					then
+						last_confirmed_handshake="$cur_time"
+					fi
+					
+					delta_time_s=$((cur_time - last_confirmed_handshake))
+					
+					if [ "$delta_time_s" -gt "$handshake_timeout_s" ]
+					then
+						echo "error: Connection timeout ($last_handshake is more than $handshake_timeout_s seconds ago)."
+						exit 110
+					fi
+					
+					echo "debug: Last handshake $delta_time_s seconds ago, less than the timeout of $handshake_timeout_s seconds. Waiting for next handshake."
+					
+					# sleep, plus one second margin
+					sleep "$((opts_persistent_keepalive_s - delta_time_s % opts_persistent_keepalive_s + 1))"
+				done
+			fi
 		;;
 		*)
 			echo "error: Invalid client command ($opts_command)." >&2
@@ -2891,12 +2971,12 @@ context_find()
 	)
 }
 
-
 opts_context=""
 opts_interface="$DEFAULT_INTERFACE"
 opts_verbosity="0"
 opts_vpn_address=""
 opts_bind_host="$DEFAULT_BIND_HOST"
+opts_alive_count_max="3"
 opts_persistent_keepalive_s="$DEFAULT_PERSISTENT_KEEPALIVE_S"
 opts_mac_address=""
 opts_prefix_mask="$DEFAULT_PREFIX_MASK"
@@ -2952,6 +3032,10 @@ do
 			
 			[ "$opts_verbosity" -lt 1 ] || echo "debug: Parsed address argument: $opts_vpn_address"
 			
+			shift
+		;;
+		--alive-count-max)
+			opts_alive_count_max="$2"
 			shift
 		;;
 		-k|--keepalive)
