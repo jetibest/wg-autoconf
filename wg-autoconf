@@ -2133,17 +2133,35 @@ EOF
 	case "$opts_command" in
 		connect)
 			connect_host="$1"
-			connect_port="${2:-$WIREGUARD_PORT}"
+			connect_port="$2"
 			
-			echo "info: Connecting to $connect_host:$connect_port..."
-			
-			# resolve connect_host to a single IPv4/IPv6 address (if getent ahostsv6, use awk '$2=="STREAM"{print $1; exit}')
-			read -r connect_host _ < <(getent hosts "$connect_host")
+			# support for both host:port and host port in one combined argument or two separate arguments
+			if [ -z "$connect_port" ]
+			then
+				# extract port from host (with IPv6 detection)
+				case "$connect_host" in
+					\[*\]:*)
+						connect_port="${connect_host##*:}"
+						connect_host="${connect_host%:*}"
+					;;
+					*:*:*)
+						# IPv6 address without port
+					;;
+					*:*)
+						connect_port="${connect_host##*:}"
+						connect_host="${connect_host%:*}"
+					;;
+				esac
+			fi
+			if [ -z "$connect_port" ]
+			then
+				connect_port="$WIREGUARD_PORT"
+			fi
 			
 			# if IPv6, wrap IPv6 in square brackets, unless it is already wrapped
 			read -r connect_host < <(ensure_ipv6_brackets "$connect_host")
 			
-			echo "info: Connecting to resolved address: $connect_host:$connect_port..."
+			echo "info: Connecting to: $connect_host:$connect_port..."
 			
 			# determine local address prefixed subnet mask
 			local_Address=()
