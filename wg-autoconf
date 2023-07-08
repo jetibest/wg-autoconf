@@ -1687,7 +1687,7 @@ EOF
 			then
 				# set a custom InterfaceID, as per command-line options (it must be hexadecimal)
 				
-				local_InterfaceId="$opts_mac_address"
+				local_InterfaceID="$opts_mac_address"
 				
 			else
 				# try to read from cache
