@@ -19,9 +19,6 @@ PROTOCOL_TIMEOUT_S="20"
 # set default metric for this Wireguard interface
 DEFAULT_METRIC="1024"
 
-# default interface to use, this is arbitrary, but wgX is common
-DEFAULT_INTERFACE="wg0"
-
 # higher MTU is better for performance, MTU is min 1280, and typically max 1500, Wireguard UDP header needs 80 bytes so 1420 would be suggested, if MTU is too high, all or some packets may drop, 1400 is a more safe value
 DEFAULT_MTU="1400"
 
@@ -356,11 +353,9 @@ print_usage()
 	echo ""
 	echo ""
 	echo "USAGE"
-	echo "  $0 [OPTIONS] ${context:-[CONTEXT]} <COMMAND>"
+	echo "  $0 [OPTIONS] <interface> ${context:-[CONTEXT]} <COMMAND>"
 	echo ""
 	echo "OPTIONS"
-	echo "  -i <interface>       Set name of the wireguard-interface."
-	echo "                       Defaults to: $DEFAULT_INTERFACE"
 	echo "  -v                   Increase verbosity."
 	echo "  -h, --help <context> Show this help. Context can be any of server, client,"
 	echo "                       or conf."
@@ -647,11 +642,11 @@ context_wg()
 				echo "error: Configuration file does not exist (/etc/wireguard/$opts_interface.conf)."
 				echo "Initialize the Wireguard interface ($opts_interface) for the first time using either:"
 				echo ""
-				echo "  $0 -i $opts_interface server listen"
+				echo "  $0 $opts_interface server listen"
 				echo ""
 				echo "or:"
 				echo ""
-				echo "  $0 -i $opts_interface client connect <server>"
+				echo "  $0 $opts_interface client connect <server>"
 				echo ""
 				echo "Alternatively, read the manual for correct usage with:"
 				echo ""
@@ -719,26 +714,26 @@ context_wg()
 			}
 			
 			# detect automatically allocated ListenPort
-			read -r listen_port < <("$0" -i "$opts_interface" conf get-interface ListenPort) || true
+			read -r listen_port < <("$0" "$opts_interface" conf get-interface ListenPort) || true
 			
 			# add rules to allow ListenPort BEFORE applying the configuration (for seamless transition to another ListenPort)
 			[ -z "$listen_port" ] || insert_ip6tables_listenport
 			
 			# synchronize configuration with wireguard (use wg-quick if available, for custom rules fallback)
 			# a dynamic ListenPort is assigned if no ListenPort is explicitly set
-			cmd "$0" "$wg_confset" "$opts_interface" <("$0" -i "$opts_interface" conf strip)
+			cmd "$0" "$opts_interface" "$wg_confset" "$opts_interface" <("$0" "$opts_interface" conf strip)
 			
 			# if no ListenPort is explicitly set, grab the dynamically assigned one, and update ip6tables rules
 			if [ -z "$listen_port" ]
 			then
-				read -r listen_port < <("$0" show "$opts_interface" listen-port) || true
+				read -r listen_port < <("$0" "$opts_interface" show "$opts_interface" listen-port) || true
 				[ -n "$listen_port" ] || listen_port="$WIREGUARD_PORT"
 				
 				insert_ip6tables_listenport
 			fi
 			
 			# grab the configured PrefixMask (servers in the same mesh should have this statically configured, and clients will receive this value from the server, or assume the default)
-			read -r local_PrefixMask < <("$0" -i "$opts_interface" conf get-interface PrefixMask) || true
+			read -r local_PrefixMask < <("$0" "$opts_interface" conf get-interface PrefixMask) || true
 			[ -n "$local_PrefixMask" ] || local_PrefixMask="$DEFAULT_VPN_PREFIX_MASK"
 			
 			has_address=false
@@ -787,7 +782,7 @@ context_wg()
 				cmd ip6tables -I "$chain"_FW_ALLOW 1 -s "${address%/*}/128" -o "$opts_interface" -j ACCEPT
 				((++iptables_chain_fw_allow))
 				
-			done < <("$0" -i "$opts_interface" conf get-interface Address)
+			done < <("$0" "$opts_interface" conf get-interface Address)
 			
 			if ! $has_address
 			then
@@ -820,7 +815,7 @@ context_wg()
 				cmd ip6tables -I "$chain"_FW_ALLOW 1 -s "${address%/*}/128" -o "$opts_interface" -j ACCEPT
 				((++iptables_chain_fw_allow))
 				
-			done < <("$0" -i "$opts_interface" conf list-servers AllowedIPs)
+			done < <("$0" "$opts_interface" conf list-servers AllowedIPs)
 			
 			# FLAG: this allows any client to communicate with any other client in the same network:
 			# allow forwarding of all traffic within the same interface
@@ -843,7 +838,7 @@ context_wg()
 				echo "info: Removed old rule from ${chain}_FW_ALLOW"
 			done
 			
-			"$0" show "$opts_interface"
+			"$0" "$opts_interface" show "$opts_interface"
 			
 			echo "info: Success"
 		;;
@@ -876,10 +871,10 @@ context_conf()
 		strip)
 			
 			# print Interface-section
-			"$0" -i "$opts_interface" conf get-interface | sed -r -n -e '/^\s*(\[Interface\]|(PrivateKey|ListenPort|FwMark)\s*=)/p'
+			"$0" "$opts_interface" conf get-interface | sed -r -n -e '/^\s*(\[Interface\]|(PrivateKey|ListenPort|FwMark)\s*=)/p'
 			
 			# print all Peer-sections (and strip $cost metric from every IP in AllowedIPs)
-			"$0" -i "$opts_interface" conf list-peers | sed -r -n -e '/^\s*AllowedIPs\s*=/ s/[$][0-9]+//g' -e '/^\s*(\[Peer\]|(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)\s*=)/p'
+			"$0" "$opts_interface" conf list-peers | sed -r -n -e '/^\s*AllowedIPs\s*=/ s/[$][0-9]+//g' -e '/^\s*(\[Peer\]|(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)\s*=)/p'
 			
 			# TODO: the "AllowedIP has nonzero host part" warning can be prevented by filtering the config accordingly (in: wg-autoconf conf strip)
 			# this can only be done by parsing every AllowedIP, expanding the IPv6 address, setting every digit beyond the subnet mask to zero, and then compressing again, before printing it
@@ -1605,13 +1600,13 @@ context_client()
 	
 	conf_file="/etc/wireguard/$opts_interface.conf"
 	
-	read -r local_PrivateKey < <("$0" -i "$opts_interface" conf get-interface PrivateKey)
+	read -r local_PrivateKey < <("$0" "$opts_interface" conf get-interface PrivateKey)
 	
 	# generate new PrivateKey if missing
 	if [ -z "$local_PrivateKey" ]
 	then
 		echo "info: Generating private key..."
-		read -r local_PrivateKey < <("$0" genkey)
+		read -r local_PrivateKey < <("$0" "$opts_interface" genkey)
 		
 		if [ -z "$local_PrivateKey" ]
 		then
@@ -1622,12 +1617,12 @@ context_client()
 		echo "info: Missing private key generated."
 		
 		# note: pass through stdin, to avoid leaking PrivateKey in process list
-		"$0" -i "$opts_interface" conf set-interface <<EOF
+		"$0" "$opts_interface" conf set-interface <<EOF
 PrivateKey = $local_PrivateKey
 EOF
 	fi
 	
-	read -r local_PublicKey < <("$0" pubkey <<<"$local_PrivateKey")
+	read -r local_PublicKey < <("$0" "$opts_interface" pubkey <<<"$local_PrivateKey")
 	
 	case "$opts_command" in
 		connect)
@@ -1668,7 +1663,7 @@ EOF
 				
 			else
 				# try to read from cache
-				read -r local_InterfaceID _ < <("$0" -i "$opts_interface" conf get-interface InterfaceID) || true
+				read -r local_InterfaceID _ < <("$0" "$opts_interface" conf get-interface InterfaceID) || true
 				
 				# automatically determine MAC-address based on available network links
 				if [ -z "$local_InterfaceID" ]
@@ -1683,7 +1678,7 @@ EOF
 					# cache this automatically determined MAC-address for consistent re-use in the future (in case network link is unplugged next reconnect)
 					if [ -n "$local_InterfaceID" ]
 					then
-						if "$0" -i "$opts_interface" conf set-interface <<EOF
+						if "$0" "$opts_interface" conf set-interface <<EOF
 InterfaceID = $local_InterfaceID
 EOF
 						then
@@ -1825,7 +1820,7 @@ EOF
 			
 			echo "info: Server is reachable at: $remote_Endpoint"
 			
-			if ! "$0" -i "$opts_interface" conf set-interface <<EOF
+			if ! "$0" "$opts_interface" conf set-interface <<EOF
 Address = $client_Address
 PrefixMask = $remote_PrefixMask
 EOF
@@ -1844,13 +1839,13 @@ EOF
 				then
 					# delete any other existing server
 					echo "info: Removing peer ($cur_PublicKey) with configuration:"
-					"$0" -i "$opts_interface" conf get-peer "$cur_PublicKey"
-					"$0" -i "$opts_interface" conf remove-peer "$cur_PublicKey"
+					"$0" "$opts_interface" conf get-peer "$cur_PublicKey"
+					"$0" "$opts_interface" conf remove-peer "$cur_PublicKey"
 				fi
 				
-			done < <("$0" -i "$opts_interface" conf list-servers PublicKey)
+			done < <("$0" "$opts_interface" conf list-servers PublicKey)
 			
-			if ! "$0" -i "$opts_interface" conf set-peer "$remote_PublicKey" <<EOF
+			if ! "$0" "$opts_interface" conf set-peer "$remote_PublicKey" <<EOF
 Type = server
 AllowedIPs = $remote_AddressLine
 Endpoint = $remote_Endpoint
@@ -1861,7 +1856,7 @@ EOF
 				exit 1
 			fi
 			
-			"$0" up "$opts_interface"
+			"$0" "$opts_interface" up "$opts_interface"
 			
 			# keep script alive, while handshakes are going on, this could also just be a separate command:
 			# wg-autoconf client monitor
@@ -1877,7 +1872,7 @@ EOF
 				if is_hostname "$remote_hostname"
 				then
 					# get resolved IP-address
-					read -r resolved_endpoint < <("$0" show "$opts_interface" endpoints | awk '$1=="'"$remote_PublicKey"'"{print $2}')
+					read -r resolved_endpoint < <("$0" "$opts_interface" show "$opts_interface" endpoints | awk '$1=="'"$remote_PublicKey"'"{print $2}')
 					
 					echo "info: Connected to resolved endpoint: $resolved_endpoint"
 					
@@ -1910,7 +1905,7 @@ EOF
 					fi
 					
 					# check last handshake connection
-					read -r last_handshake < <("$0" show "$opts_interface" latest-handshakes | awk '$1=="'"$remote_PublicKey"'"{print $2}')
+					read -r last_handshake < <("$0" "$opts_interface" show "$opts_interface" latest-handshakes | awk '$1=="'"$remote_PublicKey"'"{print $2}')
 					read -r cur_time < <(date +'%s')
 					if [ -n "$last_handshake" ]
 					then
@@ -1951,13 +1946,13 @@ context_server()
 	
 	case "$opts_command" in
 		allow)
-			if ! "$0" -i "$opts_interface" conf set-peer "$@"
+			if ! "$0" "$opts_interface" conf set-peer "$@"
 			then
 				echo "error: Failed to allow peer (conf $conf_cmd)."
 				exit 1
 			fi
 			
-			if ! "$0" update "$opts_interface"
+			if ! "$0" "$opts_interface" update "$opts_interface"
 			then
 				echo "error: Failed to allow peer (update)."
 				exit 1
@@ -1967,13 +1962,13 @@ context_server()
 			exit 0
 		;;
 		deny)
-			if ! "$0" -i "$opts_interface" conf remove-peer "$@"
+			if ! "$0" "$opts_interface" conf remove-peer "$@"
 			then
 				echo "error: Failed to deny peer (conf remove-peer)."
 				exit 1
 			fi
 			
-			if ! "$0" update "$opts_interface"
+			if ! "$0" "$opts_interface" update "$opts_interface"
 			then
 				echo "error: Failed to deny peer (update)."
 				exit 1
@@ -1986,14 +1981,14 @@ context_server()
 	
 	
 	# grab local_PrivateKey
-	local_PrivateKey="$("$0" -i "$opts_interface" conf get-interface PrivateKey)"
+	local_PrivateKey="$("$0" "$opts_interface" conf get-interface PrivateKey)"
 	
 	
 	# generate new PrivateKey if missing
 	if [ -z "$local_PrivateKey" ]
 	then
 		echo "info: Generating private key..."
-		local_PrivateKey="$("$0" genkey)"
+		local_PrivateKey="$("$0" "$opts_interface" genkey)"
 		
 		if [ -z "$local_PrivateKey" ]
 		then
@@ -2004,14 +1999,14 @@ context_server()
 		echo "info: Missing private key generated."
 		
 		# note: pass through stdin to avoid leaking PrivateKey in the process list
-		"$0" -i "$opts_interface" conf set-interface <<EOF
+		"$0" "$opts_interface" conf set-interface <<EOF
 PrivateKey = $local_PrivateKey
 EOF
 	fi
 	
 	
 	# grab local_PublicKey (extract from private key)
-	local_PublicKey="$("$0" pubkey <<<"$local_PrivateKey")"
+	local_PublicKey="$("$0" "$opts_interface" pubkey <<<"$local_PrivateKey")"
 	
 	
 	# grab local_Address value and generate local_AddressLine
@@ -2020,7 +2015,7 @@ EOF
 	do
 		local_Address+=("$address")
 		
-	done < <("$0" -i "$opts_interface" conf get-interface Address)
+	done < <("$0" "$opts_interface" conf get-interface Address)
 	
 	local_AddressLine=""
 	if [ -n "$opts_vpn_address" ] || [ "${#local_Address[@]}" -eq 0 ]
@@ -2031,7 +2026,7 @@ EOF
 		
 		echo "info: Updating Address in Interface-section."
 		
-		"$0" -i "$opts_interface" conf set-interface <<EOF
+		"$0" "$opts_interface" conf set-interface <<EOF
 Address = $local_AddressLine
 EOF
 	else
@@ -2040,20 +2035,20 @@ EOF
 	
 	
 	# grab local_ListenPort (and set local_ListenPort_configured)
-	read -r local_ListenPort < <("$0" -i "$opts_interface" conf get-interface ListenPort)
+	read -r local_ListenPort < <("$0" "$opts_interface" conf get-interface ListenPort)
 	[ -n "$local_ListenPort" ] && local_ListenPort_configured=true || local_ListenPort_configured=false
-	[ -n "$local_ListenPort" ] || read -r local_ListenPort < <("$0" show "$opts_interface" listen-port)
+	[ -n "$local_ListenPort" ] || read -r local_ListenPort < <("$0" "$opts_interface" show "$opts_interface" listen-port)
 	[ -n "$local_ListenPort" ] || local_ListenPort="$WIREGUARD_PORT"
 	
 	# grab local_Endpoint
-	read -r local_Endpoint < <("$0" -i "$opts_interface" conf get-interface Endpoint)
+	read -r local_Endpoint < <("$0" "$opts_interface" conf get-interface Endpoint)
 	
 	# fallback to current hostname (this is probably the best default behavior that should not be stored in the configuration file explicitly unless done so manually)
 	[ -n "$local_Endpoint" ] || read -r local_Endpoint < <(hostname)
 	
 	
 	# grab local_PrefixMask
-	read -r local_PrefixMask < <("$0" -i "$opts_interface" conf get-interface PrefixMask) || true
+	read -r local_PrefixMask < <("$0" "$opts_interface" conf get-interface PrefixMask) || true
 	[ -n "$local_PrefixMask" ] || local_PrefixMask="$DEFAULT_VPN_PREFIX_MASK"
 	
 	
@@ -2096,7 +2091,7 @@ EOF
 			do
 				local_Address+=("$address")
 				
-			done < <("$0" -i "$opts_interface" conf get-interface Address)
+			done < <("$0" "$opts_interface" conf get-interface Address)
 			
 			# add AllowedIPs from servers open for relay to local_Address, but with an increased cost
 			
@@ -2119,7 +2114,7 @@ EOF
 				
 				local_Address+=("${address%\$*}\$$relay_cost")
 				
-			done < <("$0" -i "$opts_interface" conf list-servers AllowedIPs)
+			done < <("$0" "$opts_interface" conf list-servers AllowedIPs)
 			
 			read -r local_AddressLine < <(join ', ' "${local_Address[@]}")
 			
@@ -2302,7 +2297,7 @@ EOF
 				remote_Endpoint="$connect_host:$remote_ListenPort"
 			fi
 			
-			if "$0" -i "$opts_interface" conf set-peer "$remote_PublicKey" <<EOF
+			if "$0" "$opts_interface" conf set-peer "$remote_PublicKey" <<EOF
 [Peer]
 Type = server
 AllowedIPs = $remote_AddressLine
@@ -2311,13 +2306,13 @@ EOF
 			then
 				echo "info: Success."
 			else
-				echo "error: Failed to update configuration ($0 -i $opts_interface conf set-peer $remote_PublicKey)."
+				echo "error: Failed to update configuration ($0 $opts_interface conf set-peer $remote_PublicKey)."
 				exit 1
 			fi
 			
-			"$0" up "$opts_interface"
+			"$0" "$opts_interface" up "$opts_interface"
 			
-			"$0" show "$opts_interface"
+			"$0" "$opts_interface" show "$opts_interface"
 		;;
 		listen)
 			set -e # exit on any failure
@@ -2330,7 +2325,7 @@ EOF
 				local_ListenPort="${listen_port:-$WIREGUARD_PORT}"
 				
 				echo "info: Updating ListenPort in Interface-section."
-				if "$0" -i "$opts_interface" conf set-interface <<EOF
+				if "$0" "$opts_interface" conf set-interface <<EOF
 ListenPort = $local_ListenPort
 EOF
 				then
@@ -2347,12 +2342,12 @@ EOF
 				
 				echo "info: Updating PrefixMask in Interface-section."
 				
-				"$0" -i "$opts_interface" conf set-interface <<EOF
+				"$0" "$opts_interface" conf set-interface <<EOF
 PrefixMask = $local_PrefixMask
 EOF
 			fi
 			
-			"$0" up "$opts_interface"
+			"$0" "$opts_interface" up "$opts_interface"
 			
 			echo "Listening on $opts_bind_host:$local_ListenPort with public key: $local_PublicKey"
 			
@@ -2361,8 +2356,8 @@ EOF
 			do
 				cmd+=("-v")
 			done
-			cmd+=("-i" "'$opts_interface'")
 			cmd+=("-k" "$opts_persistent_keepalive_s")
+			cmd+=("'$opts_interface'")
 			cmd+=("server" "accept" "'$local_PublicKey'")
 			
 			tcp_listen="tcp-listen"
@@ -2445,7 +2440,7 @@ EOF
 			interface_block+=("PrefixMask = $local_PrefixMask")
 			
 			# get peer section
-			if ! peer_info="$("$0" -i "$opts_interface" conf get-peer "$remote_PublicKey")"
+			if ! peer_info="$("$0" "$opts_interface" conf get-peer "$remote_PublicKey")"
 			then
 				# Peer is not authorized
 				echo "warn: Remote[$remote_PublicKey]: Not authorized (PublicKey = $remote_PublicKey). To authorize, run: $0 server allow $remote_PublicKey" >&2
@@ -2535,7 +2530,7 @@ EOF
 				if [ "${#lines[@]}" -gt 0 ]
 				then
 					# update configuration file
-					if "$0" -i "$opts_interface" conf set-peer "$remote_PublicKey" < <(
+					if "$0" "$opts_interface" conf set-peer "$remote_PublicKey" < <(
 						echo "[Peer]"
 						echo "Type = server"
 						for line in "${lines[@]}"
@@ -2545,7 +2540,7 @@ EOF
 					) >&2
 					then
 						# apply new configuration to Wireguard interface
-						"$0" update "$opts_interface" >&2
+						"$0" "$opts_interface" update "$opts_interface" >&2
 					else
 						echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						sock_send "Error = 500 Internal Server Error"
@@ -2715,8 +2710,8 @@ EOF
 						max_clients=65536
 					fi
 					
-					# we could also use "$0" conf has-address <Address>, to check for uniqueness
-					while [ "$count" -lt "$max_clients" ] && "$0" -i "$opts_interface" conf has-address "$client_addr"
+					# we could also use "$0" "$opts_interface" conf has-address <Address>, to check for uniqueness
+					while [ "$count" -lt "$max_clients" ] && "$0" "$opts_interface" conf has-address "$client_addr"
 					do
 						# add 1 to the last hex group (this method limits the number of clients to a maximum of 65534 clients)
 						client_addr="${client_addr%:*}:$(printf '%x' "$((16#${client_addr##*:} + 1))")"
@@ -2740,7 +2735,7 @@ EOF
 				if [ "$client_addr" != "${peer_AllowedIPs[0]}" ]
 				then
 					# check if address is unique:
-					if "$0" -i "$opts_interface" conf has-address "$client_addr"
+					if "$0" "$opts_interface" conf has-address "$client_addr"
 					then
 						echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it already exists in the configuration as an Address or AllowedIPs ($conf_file)." >&2
 						sock_send "Error = 409 Conflict (forbidden address: $client_addr, not unique)"
@@ -2765,7 +2760,7 @@ EOF
 					esac
 					
 					# check if client_addr is unique (must be done by set-peer, for atomic locking purposes)
-					if "$0" -i "$opts_interface" conf set-peer "$remote_PublicKey" >&2 <<EOF
+					if "$0" "$opts_interface" conf set-peer "$remote_PublicKey" >&2 <<EOF
 Type = client
 AllowedIPs = $client_addr
 EOF
@@ -2773,7 +2768,7 @@ EOF
 						echo "info: Remote[$remote_PublicKey]: Configuration updated. Peer (PublicKey = $remote_PublicKey) added with virtual IP-address: $client_addr" >&2
 						
 						# refresh Wireguard configuration
-						"$0" update "$opts_interface" >&2
+						"$0" "$opts_interface" update "$opts_interface" >&2
 					else
 						echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						sock_send "Error = 500 Internal Server Error"
@@ -2817,7 +2812,7 @@ EOF
 					;;
 				esac
 				
-			done < <("$0" -i "$opts_interface" conf list-servers AllowedIPs)
+			done < <("$0" "$opts_interface" conf list-servers AllowedIPs)
 			
 			# print the local address
 			prefix_addresses=()
@@ -2855,7 +2850,7 @@ EOF
 			do
 				sock_send "$line"
 				
-			done < <("$0" -i "$opts_interface" conf get-peer "$remote_PublicKey")
+			done < <("$0" "$opts_interface" conf get-peer "$remote_PublicKey")
 		;;
 		*)
 			echo "error: Invalid server command ($opts_command)." >&2
@@ -2950,7 +2945,7 @@ context_find()
 			addresses+=("$address")
 		fi
 		
-	done < <("$0" conf list-servers AllowedIPs)
+	done < <("$0" "$opts_interface" conf list-servers AllowedIPs)
 	
 	# only print the first line
 	head -n 1 < <(
@@ -2984,7 +2979,6 @@ context_find()
 }
 
 opts_context=""
-opts_interface="$DEFAULT_INTERFACE"
 opts_verbosity="0"
 opts_vpn_address=""
 opts_bind_host="$DEFAULT_BIND_HOST"
@@ -2999,10 +2993,6 @@ do
 		--)
 			shift
 			break
-		;;
-		-i|--interface)
-			opts_interface="$2"
-			shift
 		;;
 		-a|--address)
 			# if starts with colon, prefix with default fd77 prefix
@@ -3083,7 +3073,11 @@ do
 			exit 1
 		;;
 		*)
-			if [ -z "$opts_context" ]
+			if [ -z "$opts_interface" ]
+			then
+				opts_interface="$1"
+				
+			elif [ -z "$opts_context" ]
 			then
 				opts_context="$1"
 			else
