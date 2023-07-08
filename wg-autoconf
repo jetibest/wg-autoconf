@@ -831,8 +831,12 @@ context_wg()
 				ensure_ip6route "$addr/$local_PrefixMask" dev "$opts_interface" metric "$DEFAULT_METRIC"
 				
 				# enable forwarding of all traffic of this server's AllowedIPs, the server must check if it will locally allow that traffic
-				read -r normalized_addr < <(apply_ipv6_mask "${address%\$*}")
-				cmd ip6tables -I "$chain"_FW_ALLOW 1 -d "$normalized_addr" -o "$opts_interface" -j ACCEPT
+				# read -r normalized_addr < <(apply_ipv6_mask "${address%\$*}")
+				# cmd ip6tables -I "$chain"_FW_ALLOW 1 -d "$normalized_addr" -o "$opts_interface" -j ACCEPT
+				# ((++iptables_chain_fw_allow))
+				
+				# enable forwarding of traffic to any known server
+				cmd ip6tables -I "$chain"_FW_ALLOW 1 -d "${address%/*}/128" -o "$opts_interface" -j ACCEPT
 				((++iptables_chain_fw_allow))
 				
 				# enable forwarding of traffic from any known server
@@ -843,8 +847,8 @@ context_wg()
 			
 			# FLAG: this allows any client to communicate with any other client in the same network:
 			# allow forwarding of all traffic within the same interface
-			cmd ip6tables -I "$chain"_FW_ALLOW 1 -o "$opts_interface" -j ACCEPT
-			((++iptables_chain_fw_allow))
+			#cmd ip6tables -I "$chain"_FW_ALLOW 1 -o "$opts_interface" -j ACCEPT
+			#((++iptables_chain_fw_allow))
 			
 			# FLAG: to enable masquerading, we would need to allow traffic going to the MasqueradeInterface and back into the Wireguard interface
 			
