@@ -2863,7 +2863,8 @@ EOF
 			done
 			for address in "${prefix_addresses[@]}"
 			do
-				sock_send "Address = $address\$$max_cost"
+				read -r compressed_addr < <(compress_ipv6 "$address")
+				sock_send "Address = $compressed_addr\$$max_cost"
 			done
 			
 			# client exists, show all configuration entries of this client:
