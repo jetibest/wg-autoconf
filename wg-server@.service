@@ -5,8 +5,8 @@ Wants=network-online.target nss-lookup.target
 Documentation=https://github.com/jetibest/wg-autoconf
 
 [Service]
-ExecStart=/opt/wg-autoconf/wg-autoconf %i server listen
-ExecReload=/opt/wg-autoconf/wg-autoconf %i update
+ExecStart=/srv/wg-autoconf/wg-autoconf %i server listen
+ExecReload=/srv/wg-autoconf/wg-autoconf %i update
 Environment=WG_ENDPOINT_RESOLUTION_RETRIES=infinity
 
 [Install]
