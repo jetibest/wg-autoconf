@@ -2346,7 +2346,7 @@ EOF
 			set -e # exit on any failure
 			
 			read -r opts_bind_host < <(ensure_ipv6_brackets "$opts_bind_host")
-			listen_port="$1"
+			listen_port="${1#:}"
 			
 			if [ -n "$listen_port" ] && [ "$listen_port" != "$local_ListenPort" ] || ! $local_ListenPort_configured
 			then
