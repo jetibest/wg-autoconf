@@ -2396,7 +2396,7 @@ EOF
 				exit 1
 			fi
 			
-			socat "$tcp_listen":"$local_ListenPort",bind="$opts_bind_host",reuseaddr,fork system:"${cmd[*]}"
+			socat -t"$PROTOCOL_TIMEOUT_S" "$tcp_listen":"$local_ListenPort",bind="$opts_bind_host",reuseaddr,fork system:"${cmd[*]}"
 		;;
 		accept)
 			local_PublicKey="$1"
@@ -2725,6 +2725,7 @@ EOF
 					# ::1 is typically reserved for the server's own address, start at 2
 					count=2
 					client_addr="$local_AddressPrefix::$count"
+					client_addr="${client_addr//::::/::}"
 					
 					# the mask might limit clients to an even lower limit than 4 hex-digits
 					max_clients="$((2**((128 - $local_AddressMask)/2)))"
