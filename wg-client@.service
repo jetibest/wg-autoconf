@@ -1,0 +1,20 @@
+[Unit]
+Description=Client instance of wg-autoconf
+After=network-online.target nss-lookup.target
+Wants=network-online.target nss-lookup.target
+Documentation=https://github.com/jetibest/wg-autoconf
+
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/opt/wg-autoconf/wg-autoconf auto client connect %i
+ExecReload=/opt/wg-autoconf/wg-autoconf auto update
+Environment=WG_ENDPOINT_RESOLUTION_RETRIES=infinity
+
+Restart=always
+RestartSec=2
+RestartSteps=10
+RestartMaxDelaySec=120
+
+[Install]
+WantedBy=multi-user.target
