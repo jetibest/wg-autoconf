@@ -739,6 +739,9 @@ context_wg()
 			has_address=false
 			is_server=true
 			
+			# instead of: cmd ip -6 address flush dev "$opts_interface", we can seamlessly remove old addresses, by keeping track of added addresses:
+			added_ip6_addresses=()
+			
 			# add link device addresses
 			while read -r address
 			do
@@ -763,6 +766,7 @@ context_wg()
 				
 				# subnet mask is not allowed in a link address, so force /128
 				ensure_ip6address "${address%/*}/128" dev "$opts_interface"
+				added_ip6_addresses+=("${address%/*}/128")
 				has_address=true
 				
 				# expand address
@@ -788,6 +792,26 @@ context_wg()
 			then
 				echo "warning: Device $opts_interface has no virtual IPv6-address assigned. Check [Interface] Address configuration." >&2
 			fi
+			
+			# check existing addresses
+			while read -r _ _ _ address _
+			do
+				found=false
+				for added_ip6_address in "${added_ip6_addresses[@]}"
+				do
+					if [ "$added_ip6_address" = "$address" ]
+					then
+						found=true
+					fi
+				done
+				
+				if ! $found
+				then
+					# this is an old address, maybe the address changed, so remove it
+					cmd ip -6 address del "$address" dev "$opts_interface" scope global
+				fi
+				
+			done < <(ip -iec -oneline -6 address show dev "$opts_interface" scope global)
 			
 			# one IP per line, multiple lines may belong to one peer
 			while read -r pubkey address
