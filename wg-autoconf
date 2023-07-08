@@ -3107,6 +3107,21 @@ do
 			then
 				opts_interface="$1"
 				
+				if [ "$opts_interface" = "auto" ]
+				then
+					# interpret special value for interface 'auto' will set interface to wgX, where X is the first number (starting from 0) that has a configuration file, or has no existing link device
+					for ((i=0;i<255;++i))
+					do
+						if [ -e "/etc/wireguard/wg$i.conf" ] || ! ip link show dev "wg$i" >/dev/null 2>/dev/null
+						then
+							opts_interface="wg$i"
+							break
+						fi
+					done
+					
+					# when 255 is reached, give up, and use 'auto' as literal string for the link device
+				fi
+				
 			elif [ -z "$opts_context" ]
 			then
 				opts_context="$1"
@@ -3118,6 +3133,11 @@ do
 	
 	shift || break
 done
+
+if [ -z "$opts_interface" ]
+then
+	echo "error: Invalid usage. No interface given."
+fi
 
 case "$opts_context" in
 	help)
