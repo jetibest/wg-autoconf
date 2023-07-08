@@ -5,6 +5,8 @@
 # note: The wg-autoconf non-standard configuration is stored in /etc/wireguard/<interface>.autoconf, the derived configuration for Wireguard is in /etc/wireguard/<interface>.conf
 # note: It is highly recommended to change the Wireguard port from 51820 to a non-ephemeral port, since another process may already use this port, which results in a higher chance of conflict. For example, use port 5182 or 5177 instead, or fd77.
 # note: Wireguard is dual-stack by default.
+# note: The virtual IPv6-address consists of: <16bit PREFIX>:<16bit GROUP>:<16bit SUBNET>:<16bit RESERVED>:<64bit INTERFACE_ID>
+
 
 # TODO: make separate wg utility that enables easy setup for MASQUERADE VPN usage (which does ipv4/ipv6 dual stack configuration)
 
@@ -14,25 +16,27 @@ WIREGUARD_PORT="51820"
 # timeout for socket connections, where we're waiting for data
 PROTOCOL_TIMEOUT_S="20"
 
-# metrics to use for routes that are direct vs relayed routes
-# relay metric must be higher than server metric
-LOCAL_METRIC="300"
-RELAY_METRIC_FACTOR="100"
+# set default metric for this Wireguard interface
+DEFAULT_METRIC="1024"
 
 # default interface to use, this is arbitrary, but wgX is common
 DEFAULT_INTERFACE="wg0"
 
-# higher MTU is better for performance, MTU is min 1280, and typically max 1500, if MTU is too high, all or some packets may drop, usually 1400 is a safe value
+# higher MTU is better for performance, MTU is min 1280, and typically max 1500, Wireguard UDP header needs 80 bytes so 1420 would be suggested, if MTU is too high, all or some packets may drop, 1400 is a more safe value
 DEFAULT_MTU="1400"
 
 # Sensible default values:
-DEFAULT_VPN_PREFIX="fd77"
-DEFAULT_VPN_ADDRESS="$DEFAULT_VPN_PREFIX:1::1/32"
+DEFAULT_VPN_PREFIX="fd77:1"
+DEFAULT_VPN_ADDRESS="$DEFAULT_VPN_PREFIX::1/48" # 48 is the subnet mask of this interface
+DEFAULT_VPN_PREFIX_MASK="32" # unique prefix mask for routing (to have one route for multiple not yet known subnets/servers)
 
-DEFAULT_PREFIX_MASK="16"
-DEFAULT_SUBNET_MASK="48"
 DEFAULT_BIND_HOST="::"
 DEFAULT_PERSISTENT_KEEPALIVE_S="25"
+
+# by convention, it's good to route prefix fd77:X to wgX, where X >= 1
+# X could be a base36 (alphanumeric) encoded identifier of basically three digits/characters long identifying the group
+# 'wrg', short for 'wireguard', would become 42460 (= parseInt('wrg', 36)), to hexadecimal that is: 'a5dc' (= (42460).toString(16))
+# so the unique prefix becomes: fd77:a5dc
 
 expand_ipv6()
 {
@@ -318,6 +322,19 @@ EOF
 	
 	return 1
 }
+array_contains()
+{
+	__array_contains_needle="$1"
+	shift
+	for __array_contains_arg in "$@"
+	do
+		if [ "$__array_contains_arg" = "$__array_contains_needle" ]
+		then
+			return 0
+		fi
+	done
+	return 1
+}
 
 
 print_usage()
@@ -445,6 +462,7 @@ print_usage()
 		echo "SERVER LISTEN OPTIONS"
 		echo ""
 		echo "  -a <ipv6-address> Set address of the server in the virtual IPv6 network"
+		echo "                    Also use a mask to specify the subnet mask of this server."
 		echo "                    Defaults to: $DEFAULT_VPN_ADDRESS"
 		echo "  -b <bind-host>    Set host to bind to."
 		echo "                    Defaults to: $DEFAULT_BIND_HOST"
@@ -456,13 +474,7 @@ print_usage()
 		echo "                    use this to setup routing. This ensures that if a new"
 		echo "                    server is added to the mesh, the client can immediately"
 		echo "                    route traffic to the new server as well."
-		echo "                    Defaults to: $DEFAULT_PREFIX_MASK"
-		echo "  -s <mask>         Specify a bitmask for the subnet division. Any client that"
-		echo "                    is connected to the virtual network can access any other"
-		echo "                    client, but only if it is in the same subnet."
-		echo "                    To disable this functionality, set the mask to 0, or any"
-		echo "                    value less than the server Address mask."
-		echo "                    Defaults to: $DEFAULT_SUBNET_MASK"
+		echo "                    Defaults to: $DEFAULT_VPN_PREFIX_MASK"
 		echo ""
 		echo ""
 	fi
@@ -622,7 +634,7 @@ context_wg()
 			cmd ip6tables -F "$chain"_FW
 			cmd ip6tables -X "$chain"_FW
 			
-			cmd ip6tables -D "$chain"_FW -p udp -j "$chain"_FW_ALLOW
+			cmd ip6tables -D "$chain"_FW -j "$chain"_FW_ALLOW
 			cmd ip6tables -F "$chain"_FW_ALLOW
 			cmd ip6tables -X "$chain"_FW_ALLOW
 		;;
@@ -680,7 +692,7 @@ context_wg()
 			if cmd ip6tables -N "$chain"_FW_ALLOW
 			then
 				# there are 3 rules in "$chain"_FW, add before the DROP
-				cmd ip6tables -I "$chain"_FW 3 -p udp -j "$chain"_FW_ALLOW
+				cmd ip6tables -I "$chain"_FW 3 -j "$chain"_FW_ALLOW
 			fi
 			
 			iptables_chain_in=0
@@ -725,20 +737,19 @@ context_wg()
 				insert_ip6tables_listenport
 			fi
 			
-			# grab the configured SubnetMask
-			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask) || true
-			[ -n "$local_SubnetMask" ] || local_SubnetMask="$DEFAULT_SUBNET_MASK"
-			
-			# gather prefixes, for ip6tables rules later on
-			prefixes=()
-			
+			# grab the configured PrefixMask (servers in the same mesh should have this statically configured, and clients will receive this value from the server, or assume the default)
+			read -r local_PrefixMask < <("$0" -i "$opts_interface" conf get-interface PrefixMask) || true
+			[ -n "$local_PrefixMask" ] || local_PrefixMask="$DEFAULT_VPN_PREFIX_MASK"
 			
 			has_address=false
+			is_server=true
 			
 			# add link device addresses
 			while read -r address
 			do
 				[ -n "$address" ] || continue
+				
+				# NOTE: cost is provided by a server to the client to indicate which AllowedIPs it is connected to, so that a client may know the size of the mesh that the server is in, and which servers are curerntly available
 				
 				# Interface-address is currently not supposed to have a metric cost, but it might be in future, so simply trim the cost if it exists
 				address="${address%\$*}"
@@ -749,40 +760,32 @@ context_wg()
 					*) address="$address/128"
 				esac
 				
-				# subnet mask is not allowed a link address
+				case "$address" in
+					*/128)
+						is_server=false
+					;;
+				esac
+				
+				# subnet mask is not allowed in a link address, so force /128
 				ensure_ip6address "${address%/*}/128" dev "$opts_interface"
 				has_address=true
 				
-				# only add route if it should catch a non-128 mask
-				case "$address" in
-					*/128|*/) ;;
-					*/*)
-						# add the route to own Interface address
-						ensure_ip6route "$address" dev "$opts_interface" metric "$LOCAL_METRIC"
-					;;
-				esac
+				# expand address
+				read -r expanded_addr < <(expand_ipv6 "$address" | tr -d ':')
 				
-				# allow any traffic from this server to anywhere else
-				cmd ip6tables -I "$chain"_FW_ALLOW 1 -s "${address%/*}/128" -j ACCEPT
+				# back to a correct ipv6 address
+				read -r addr < <(hex_to_expanded_ipv6 "${expanded_addr:0:$(($local_PrefixMask/4))}")
+				
+				# ensure routing for the given prefix (normally the first 32 bits)
+				ensure_ip6route "$addr/$local_PrefixMask" dev "$opts_interface" metric "$DEFAULT_METRIC"
+				
+				# enable forwarding of traffic to any local device address
+				cmd ip6tables -I "$chain"_FW_ALLOW 1 -d "${address%/*}/128" -o "$opts_interface" -j ACCEPT
 				((++iptables_chain_fw_allow))
 				
-				# allow anyone to access this server
-				cmd ip6tables -I "$chain"_FW_ALLOW 1 -d "${address%/*}/128" -j ACCEPT
+				# enable forwarding of traffic from any local device address
+				cmd ip6tables -I "$chain"_FW_ALLOW 1 -s "${address%/*}/128" -o "$opts_interface" -j ACCEPT
 				((++iptables_chain_fw_allow))
-				
-				# gather prefixes for ip6tables rules later on
-				case "$address" in
-					*/128) ;;
-					*/*)
-						# only add if the prefix mask is less than the subnet mask
-						prefix_mask="${address#*/}"
-						if [ "$prefix_mask" -lt "$local_SubnetMask" ]
-						then
-							read -r prefix < <(expand_ipv6 "$address" | tr -d ':')
-							prefixes+=("${prefix:0:$(($prefix_mask/4))}")
-						fi
-					;;
-				esac
 				
 			done < <("$0" -i "$opts_interface" conf get-interface Address)
 			
@@ -791,128 +794,42 @@ context_wg()
 				echo "warning: Device $opts_interface has no virtual IPv6-address assigned. Check [Interface] Address configuration." >&2
 			fi
 			
-			max_relay_cost="0"
-			
 			# one IP per line, multiple lines may belong to one peer
 			while read -r pubkey address
 			do
 				[ -n "$address" ] || continue
 				
-				# AllowedIPs may contain cost ($), apply the cost as a metric to the ip -6 route
-				relay_cost="0"
-				case "$address" in
-					*\$) ;;
-					*\$*)
-						relay_ip="${address%\$*}"
-						relay_cost="${address#*\$}"
-					;;
-				esac
+				# AllowedIPs may contain cost ($), if non-zero, then this indicates that the given server can forward traffic for the given IP/mask
+				address="${address%\$*}"
 				
-				# increase relay cost for once, since this is a server
-				relay_cost="$((relay_cost + 1))"
+				# expand address
+				read -r expanded_addr < <(expand_ipv6 "$address" | tr -d ':')
 				
-				# keep track of maximum relay cost
-				[ "$relay_cost" -le "$max_relay_cost" ] || max_relay_cost="$relay_cost"
+				# back to a correct ipv6 address
+				read -r addr < <(hex_to_expanded_ipv6 "${expanded_addr:0:$(($local_PrefixMask/4))}")
 				
-				# grab the mask, and ensure any traffic directed at this prefix is routed to the wireguard link
-				ensure_ip6route "${address%\$*}" dev "$opts_interface" metric "$((RELAY_METRIC_FACTOR * relay_cost + LOCAL_METRIC))"
+				# ensure routing for the given prefix (normally the first 32 bits)
+				ensure_ip6route "$addr/$local_PrefixMask" dev "$opts_interface" metric "$DEFAULT_METRIC"
 				
-				# allow any traffic from this server to anywhere else
-				cmd ip6tables -I "$chain"_FW_ALLOW 1 -s "${address%/*}/128" -j ACCEPT
+				# enable forwarding of all traffic of this server's AllowedIPs, the server must check if it will locally allow that traffic
+				read -r normalized_addr < <(apply_ipv6_mask "${address%\$*}")
+				cmd ip6tables -I "$chain"_FW_ALLOW 1 -d "$normalized_addr" -o "$opts_interface" -j ACCEPT
 				((++iptables_chain_fw_allow))
 				
-				read -r normalized_address < <(apply_ipv6_mask "${address%\$*}")
-				
-				# allow any outgoing traffic to the subnet of the other server, that server will need to check if the incoming traffic is allowed
-				cmd ip6tables -I "$chain"_FW_ALLOW 1 -d "$normalized_address" -j ACCEPT
+				# enable forwarding of traffic from any known server
+				cmd ip6tables -I "$chain"_FW_ALLOW 1 -s "${address%/*}/128" -o "$opts_interface" -j ACCEPT
 				((++iptables_chain_fw_allow))
-				
-				# gather prefixes for ip6tables rules later on
-				case "$address" in
-					*/128) ;;
-					*/*)
-						# only add if the prefix mask is less than the subnet mask
-						prefix_mask="${address#*/}"
-						prefix_mask="${prefix_mask%\$*}"
-						if [ "$prefix_mask" -lt "$local_SubnetMask" ]
-						then
-							read -r prefix < <(expand_ipv6 "${address%\$*}" | tr -d ':')
-							prefixes+=("${prefix:0:$(($prefix_mask/4))}")
-						fi
-					;;
-				esac
 				
 			done < <("$0" -i "$opts_interface" conf list-servers AllowedIPs)
 			
-			# as a client, make sure all traffic for the available prefixes is routed to the given wireguard interface (but at a lowest priority, so individual servers can come first where needed)
-			for prefix in "${prefixes[@]}"
-			do
-				read -r addr < <(hex_to_expanded_ipv6 "${prefix:0:$((opts_prefix_mask / 4))}")
-				
-				ensure_ip6route "$addr/$opts_prefix_mask" dev "$opts_interface" metric "$((RELAY_METRIC_FACTOR * (max_relay_cost + 1) + LOCAL_METRIC))"
-			done
+			# FLAG: this allows any client to communicate with any other client in the same network:
+			# allow forwarding of all traffic within the same interface
+			cmd ip6tables -I "$chain"_FW_ALLOW 1 -o "$opts_interface" -j ACCEPT
+			((++iptables_chain_fw_allow))
 			
-			# keep track of groups, and do only one aggregated ip6tables update
-			groups=()
+			# FLAG: to enable masquerading, we would need to allow traffic going to the MasqueradeInterface and back into the Wireguard interface
 			
-			echo "allowing anyone to access this client from same subnet"
-			
-			# allow anyone to access this incoming client, as long as they are from the same subnet
-			while read -r pubkey allowed_ip
-			do
-				[ -n "$allowed_ip" ] || continue
-				
-				# trim mask, by definition, a client can not have any other mask than 128
-				addr="${allowed_ip%/*}"
-				
-				# expand the address, and remove colons
-				read -r addr < <(expand_ipv6 "$addr" | tr -d ':')
-				
-				# extract the first N digits, i.e. for 48-bit that is 12 digits
-				addr="${addr:0:$(($local_SubnetMask/4))}"
-				
-				subnet_prefix="$addr"
-				
-				# insert colons every 4 digits
-				read -r addr < <(hex_to_expanded_ipv6 "$addr")
-				
-				# add a mask
-				addr="$addr/$local_SubnetMask"
-				
-				# recompress expanded IPv6-address (this also adds a trailing ::)
-				# local group addr is now a subnet group with its appropriate subnet mask
-				read -r local_group_addr < <(compress_ipv6 "$addr")
-				
-				# we only need to check incoming traffic, outgoing traffic is already allowed per server
-				# allow incoming traffic of the same subnet group, but from all different servers (including this server itself)
-				for prefix in "${prefixes[@]}"
-				do
-					# replace addr with prefix, prefix is already limited to its mask, and expanded IPv6 without colons, and only is added to prefixes iff the prefix mask is less than the subnet mask
-					read -r addr < <(hex_to_expanded_ipv6 "$prefix${subnet_prefix:${#prefix}}")
-					
-					# compress_ipv6 also adds :: at the end, and preserves mask
-					read -r group_addr < <(compress_ipv6 "$addr/$local_SubnetMask")
-					
-					# allow where: group_addr is the source, local_group_addr is the destination
-					groups+=("$group_addr" "$local_group_addr")
-				done
-				
-			done < <("$0" -i "$opts_interface" conf list-clients AllowedIPs)
-			
-			if [ "${#groups[@]}" -ne 0 ]
-			then
-				# insert rules, but only if unique (prevent one rule per client)
-				printf -- "-I ${chain}_FW_ALLOW 1 -s %s -d %s -o $opts_interface -j ACCEPT\n" "${groups[@]}" | sort | uniq | while read -r rule
-				do
-					cmd ip6tables $rule
-					((++iptables_chain_fw_allow))
-				done
-			fi
-			
-			# clients must always be part of a subnet of a server, so no routing rules required for those
-			# because the server should already have a mask
-			
-			# enable IPv6 forwarding
+			# allow IPv6 forwarding
 			cmd sysctl net.ipv6.conf.all.accept_ra=2
 			cmd sysctl net.ipv6.conf.all.forwarding=1
 			
@@ -982,7 +899,7 @@ context_conf()
 		interface_ListenPort=""
 		interface_Endpoint=""
 		interface_InterfaceID=""
-		interface_SubnetMask=""
+		interface_PrefixMask=""
 		
 		peer_PublicKey=""
 		peer_Endpoint=""
@@ -1010,7 +927,7 @@ context_conf()
 			[ -z "$interface_ListenPort" ] || printf '%s\n' "ListenPort = $interface_ListenPort"
 			[ -z "$interface_Endpoint" ] || printf '%s\n' "Endpoint = $interface_Endpoint"
 			[ -z "$interface_InterfaceID" ] || printf '%s\n' "InterfaceID = $interface_InterfaceID"
-			[ -z "$interface_SubnetMask" ] || printf '%s\n' "SubnetMask = $interface_SubnetMask"
+			[ -z "$interface_PrefixMask" ] || printf '%s\n' "PrefixMask = $interface_PrefixMask"
 			
 		elif [ "$section" = "Peer" ]
 		then
@@ -1162,8 +1079,8 @@ context_conf()
 						InterfaceID)
 							[ -z "$interface_InterfaceID" ] || printf '%s\n' "$interface_InterfaceID"
 						;;
-						SubnetMask)
-							[ -z "$interface_SubnetMask" ] || printf '%s\n' "$interface_SubnetMask"
+						PrefixMask)
+							[ -z "$interface_PrefixMask" ] || printf '%s\n' "$interface_PrefixMask"
 						;;
 						'')
 							print_section_buffer
@@ -1346,8 +1263,8 @@ context_conf()
 											interfaceid)
 												read -r interface_InterfaceID <<<"$value"
 											;;
-											subnetmask)
-												read -r interface_SubnetMask <<<"$value"
+											prefixmask)
+												read -r interface_PrefixMask <<<"$value"
 											;;
 										esac
 									;;
@@ -1412,8 +1329,8 @@ context_conf()
 										InterfaceID=*)
 											read -r interface_InterfaceID <<<"${stdin_line#*=}"
 										;;
-										SubnetMask=*)
-											read -r interface_SubnetMask <<<"${stdin_line#*=}"
+										PrefixMask=*)
+											read -r interface_PrefixMask <<<"${stdin_line#*=}"
 										;;
 									esac
 								;;
@@ -1622,9 +1539,9 @@ context_conf()
 							parsed=true
 							read -r interface_InterfaceID <<<"${line#*=}"
 						;;
-						SubnetMask=*)
+						PrefixMask=*)
 							parsed=true
-							read -r interface_SubnetMask <<<"${line#*=}"
+							read -r interface_PrefixMask <<<"${line#*=}"
 						;;
 					esac
 				;;
@@ -1787,6 +1704,7 @@ EOF
 			remote_ListenPort=""
 			remote_Address=()
 			remote_Endpoint=""
+			remote_PrefixMask=""
 			
 			client_Address=""
 			
@@ -1832,6 +1750,9 @@ EOF
 							;;
 							Endpoint=*)
 								read -r remote_Endpoint <<<"${line#*=}"
+							;;
+							PrefixMask=*)
+								read -r remote_PrefixMask <<<"${line#*=}"
 							;;
 						esac
 					;;
@@ -1906,6 +1827,7 @@ EOF
 			
 			if ! "$0" -i "$opts_interface" conf set-interface <<EOF
 Address = $client_Address
+PrefixMask = $remote_PrefixMask
 EOF
 			then
 				echo "error: Failed to update configuration (set-interface)."
@@ -2130,6 +2052,11 @@ EOF
 	[ -n "$local_Endpoint" ] || read -r local_Endpoint < <(hostname)
 	
 	
+	# grab local_PrefixMask
+	read -r local_PrefixMask < <("$0" -i "$opts_interface" conf get-interface PrefixMask) || true
+	[ -n "$local_PrefixMask" ] || local_PrefixMask="$DEFAULT_VPN_PREFIX_MASK"
+	
+	
 	case "$opts_command" in
 		connect)
 			connect_host="$1"
@@ -2225,6 +2152,7 @@ EOF
 			remote_Address=()
 			remote_ListenPort=""
 			remote_Endpoint=""
+			remote_PrefixMask=""
 			
 			assigned_Address=()
 			
@@ -2271,6 +2199,9 @@ EOF
 							Endpoint=*)
 								read -r remote_Endpoint <<<"${line#*=}"
 							;;
+							PrefixMask=*)
+								read -r remote_PrefixMask <<<"${line#*=}"
+							;;
 						esac
 					;;
 					Peer)
@@ -2289,12 +2220,26 @@ EOF
 					sock_send "PublicKey = $local_PublicKey"
 					sock_send "Address = $local_AddressLine"
 					sock_send "Endpoint = $local_Endpoint"
+					sock_send "PrefixMask = $local_PrefixMask"
 					sock_send ""
 				); echo -n "$?")
 			
 			if [ "$socat_exit_code" -ne 0 ]
 			then
 				echo "error: Connection failure ($socat_exit_code)."
+				exit 1
+			fi
+			
+			if [ -z "$remote_PrefixMask" ]
+			then
+				echo "note: Remote server has no explicitly defined PrefixMask, defaulting to $DEFAULT_VPN_PREFIX_MASK."
+				remote_PrefixMask="$DEFAULT_VPN_PREFIX_MASK"
+			fi
+			
+			if [ "$local_PrefixMask" != "$remote_PrefixMask" ]
+			then
+				echo "error: Remote PrefixMask ($remote_PrefixMask) does not match the local PrefixMask ($local_PrefixMask)."
+				echo "note: To match the remote server configuration, run: $0 conf set-interface PrefixMask=$remote_PrefixMask"
 				exit 1
 			fi
 			
@@ -2395,19 +2340,15 @@ EOF
 				fi
 			fi
 			
-			# grab local_SubnetMask
-			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask) || true
-			[ -n "$local_SubnetMask" ] || local_SubnetMask="$DEFAULT_SUBNET_MASK"
-			
-			if [ -n "$opts_subnet_mask" ] && [ "$opts_subnet_mask" != "$local_SubnetMask" ]
+			if [ -n "$opts_prefix_mask" ] && [ "$opts_prefix_mask" != "$local_PrefixMask" ]
 			then
-				# specified a custom SubnetMask in the configuration
-				local_SubnetMask="$opts_subnet_mask"
+				# specified a custom PrefixMask in the configuration
+				local_PrefixMask="$opts_prefix_mask"
 				
-				echo "info: Updating SubnetMask in Interface-section."
+				echo "info: Updating PrefixMask in Interface-section."
 				
 				"$0" -i "$opts_interface" conf set-interface <<EOF
-SubnetMask = $local_SubnetMask
+PrefixMask = $local_PrefixMask
 EOF
 			fi
 			
@@ -2452,6 +2393,7 @@ EOF
 			# in case of server:
 			remote_Address=()        # how to reach the server directly, and a mask specifying which clients it can also support, and $[0-9]+ for a cost metric for relaying servers (mandatory)
 			remote_Endpoint=""       # how to reach this server from outside (optional, but sort of mandatory if server, otherwise the connection is only half)
+			remote_PrefixMask=""     # ensure the remote PrefixMask matches the local PrefixMask, otherwise no connection should occur
 			set_remote_Endpoint=false
 			
 			while read -t "$PROTOCOL_TIMEOUT_S" -r line
@@ -2475,6 +2417,9 @@ EOF
 						set_remote_Endpoint=true
 						read -r remote_Endpoint <<<"${line#*=}"
 					;;
+					PrefixMask=*)
+						read -r remote_PrefixMask <<<"${line#*=}"
+					;;
 				esac
 				
 			done # read from stdin, client must close stdin before server can continue (that is to half-close socket on their end)
@@ -2496,9 +2441,8 @@ EOF
 			# grab Endpoint and print if exists, it should be the public address of this server, possibly DNS with round-robin
 			[ -z "$local_Endpoint" ] || interface_block+=("Endpoint = $local_Endpoint")
 			
-			# grab the latest known SubnetMask
-			read -r local_SubnetMask < <("$0" -i "$opts_interface" conf get-interface SubnetMask) || true
-			[ -n "$local_SubnetMask" ] || local_SubnetMask="$DEFAULT_SUBNET_MASK"
+			# show the PrefixMask
+			interface_block+=("PrefixMask = $local_PrefixMask")
 			
 			# get peer section
 			if ! peer_info="$("$0" -i "$opts_interface" conf get-peer "$remote_PublicKey")"
@@ -2548,6 +2492,20 @@ EOF
 			
 			if [ "$peer_Type" = "server" ]
 			then
+				if [ -z "$remote_PrefixMask" ]
+				then
+					remote_PrefixMask="$DEFAULT_VPN_PREFIX_MASK"
+				fi
+				
+				# ensure correct configuration between servers in the same mesh
+				if [ "$remote_PrefixMask" != "$local_PrefixMask" ]
+				then
+					echo "error: Remote[$remote_PublicKey]: PrefixMask configuration mismatch. Remote PrefixMask ($remote_PrefixMask) does not match local PrefixMask ($local_PrefixMask)." >&2
+					sock_send "Error = 400 Bad Request"
+					sock_send_lines "${interface_block[@]}"
+					exit 40
+				fi
+				
 				# peer is an authorized server, connecting with us again
 				lines=()
 				
@@ -2709,11 +2667,11 @@ EOF
 						client_addr_prefix="${client_addr:0:$((local_AddressMask / 4))}"
 						offset="${#client_addr_prefix}"
 						
-						# for security, ensure that offset is not lower than $local_SubnetMask
-						subnet_offset="$((local_SubnetMask / 4))"
-						if [ "$offset" -lt "$subnet_offset" ]
+						# for security, ensure that offset is not lower than 64-bit, a client can never remotely touch anything before 64-bit, that's only for the server to decide on
+						clientsubnet_offset="$((64 / 4))"
+						if [ "$offset" -lt "$clientsubnet_offset" ]
 						then
-							offset="$subnet_offset"
+							offset="$clientsubnet_offset"
 						fi
 						
 						# if the remote Interface ID is not long enough to fill up the zeroes, move offset even more to the right (align to right)
@@ -2828,13 +2786,10 @@ EOF
 			# only if client is authorized (and after possible [Peer]-server section has been updated), we show properties about the internals of this virtual network:
 			sock_send_lines "${interface_block[@]}"
 			
-			# print the local address
-			for address in "${local_Address[@]}"
-			do
-				sock_send "Address = $address"
-			done
-			
+			relay_addresses=()
 			# here we also want to print every Peer we relay for as our own Address, but with increased cost
+			# this is for both the client and server so it may discover other servers in the mesh
+			max_cost="1024"
 			while read -r pubkey address
 			do
 				[ -n "$address" ] || continue
@@ -2849,14 +2804,48 @@ EOF
 							# default relay cost, if no number is indicated at the end, is zero
 							relay_cost="0"
 						fi
-						sock_send "Address = ${relay_ip}\$$((relay_cost + 1))"
+						
+						if [ "$relay_cost" -gt "$max_cost" ]
+						then
+							max_cost="$relay_cost"
+						fi
+						
+						relay_addresses+=("${relay_ip}\$$((relay_cost + 1))")
 					;;
 					*)
-						sock_send "Address = ${address}\$1"
+						relay_addresses+=("${address}\$1")
 					;;
 				esac
 				
 			done < <("$0" -i "$opts_interface" conf list-servers AllowedIPs)
+			
+			# print the local address
+			prefix_addresses=()
+			for address in "${local_Address[@]}"
+			do
+				sock_send "Address = $address"
+				
+				# expand address
+				read -r expanded_addr < <(expand_ipv6 "$address" | tr -d ':')
+				# back to a correct ipv6 address
+				read -r addr < <(hex_to_expanded_ipv6 "${expanded_addr:0:$(($local_PrefixMask/4))}")
+				# create catchall address based on prefix
+				prefix_catchall_addr="${addr}/$local_PrefixMask"
+				
+				# check if already printed
+				if ! array_contains "$prefix_catchall_addr" "${prefix_addresses[@]}"
+				then
+					prefix_addresses+=("$prefix_catchall_addr")
+				fi
+			done
+			for address in "${relay_addresses[@]}"
+			do
+				sock_send "Address = $address"
+			done
+			for address in "${prefix_addresses[@]}"
+			do
+				sock_send "Address = $address\$$max_cost"
+			done
 			
 			# client exists, show all configuration entries of this client:
 			# this is mostly useful for the client so that it may read AllowedIPs and set it as its [Interface]'s Address
@@ -2881,7 +2870,7 @@ context_find()
 	opts_vpn_address="$1"
 	
 	# extract subnet mask, default to default prefix mask
-	find_mask="$opts_subnet_mask"
+	find_mask="$DEFAULT_VPN_PREFIX_MASK"
 	case "$opts_vpn_address" in
 		*/*)
 			find_mask="${opts_vpn_address#*/}"
@@ -2915,8 +2904,11 @@ context_find()
 	addresses=()
 	
 	# find the subnet at which
-	while read -r address _
+	while read -r pubkey address _
 	do
+		# remove cost
+		address="${address%\$*}"
+		
 		# extract route mask
 		route_mask="128"
 		case "$address" in
@@ -2958,7 +2950,7 @@ context_find()
 			addresses+=("$address")
 		fi
 		
-	done < <(ip -6 route show dev "$opts_interface") # TODO: possibly sort by metric ascending
+	done < <("$0" conf list-servers AllowedIPs)
 	
 	# only print the first line
 	head -n 1 < <(
@@ -2999,8 +2991,7 @@ opts_bind_host="$DEFAULT_BIND_HOST"
 opts_alive_count_max="3"
 opts_persistent_keepalive_s="$DEFAULT_PERSISTENT_KEEPALIVE_S"
 opts_mac_address=""
-opts_prefix_mask="$DEFAULT_PREFIX_MASK"
-opts_subnet_mask=""
+opts_prefix_mask="$DEFAULT_VPN_PREFIX_MASK"
 
 while [ "$#" -gt 0 ]
 do
@@ -3077,10 +3068,6 @@ do
 		;;
 		-p|--prefix-mask)
 			opts_prefix_mask="${2#*/}"
-			shift
-		;;
-		-s|--subnet-mask)
-			opts_subnet_mask="${2#*/}"
 			shift
 		;;
 		-v|-vv)
