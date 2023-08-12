@@ -484,7 +484,9 @@ print_usage()
 		echo "      will be completely overwritten. Do NOT run as server, since all"
 		echo "      existing clients will be disconnected, and manual configuration changes"
 		echo "      will be deleted."
-		echo "      Port defaults to $WIREGUARD_PORT."
+		echo "      Protocol will first try to use HTTP using libcurl, following potential"
+		echo "      redirects like switching to HTTPS."
+		echo "      Port defaults to 80 if HTTP detected, and otherwise: $WIREGUARD_PORT"
 		echo ""
 		echo ""
 		echo "CLIENT CONNECT OPTIONS"
@@ -1675,10 +1677,10 @@ EOF
 					;;
 				esac
 			fi
-			if [ -z "$connect_port" ]
-			then
-				connect_port="$WIREGUARD_PORT"
-			fi
+			#if [ -z "$connect_port" ]
+			#then
+			#	connect_port="$WIREGUARD_PORT"
+			#fi
 			
 			# if IPv6, wrap IPv6 in square brackets, unless it is already wrapped
 			read -r connect_host < <(ensure_ipv6_brackets "$connect_host")
@@ -1720,7 +1722,12 @@ EOF
 				fi
 			fi
 			
-			echo "info: Connecting to: $connect_host:$connect_port..."
+			if [ -z "$connect_port" ]
+			then
+				echo "info: Connecting to: $connect_host... Port defaults to first checking HTTP-port (:80), with fallback at :$WIREGUARD_PORT"
+			else
+				echo "info: Connecting to: $connect_host:$connect_port..."
+			fi
 			echo "info: Local public key: $local_PublicKey"
 			
 			remote_PublicKey=""
@@ -1731,10 +1738,10 @@ EOF
 			
 			client_Address=""
 			
-			conn_cmd=(socat -t"$PROTOCOL_TIMEOUT_S" - tcp:"$connect_host":"$connect_port")
-			if is_http "$connect_host" "$connect_port"
+			conn_cmd=(socat -t"$PROTOCOL_TIMEOUT_S" - tcp:"$connect_host":"${connect_port:-$WIREGUARD_PORT}")
+			if is_http "$connect_host" "${connect_port:-80}"
 			then
-				conn_cmd=(curl --data-binary @- --insecure --max-time "$PROTOCOL_TIMEOUT_S" -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:$connect_port/.well-known/wg-autoconf/")
+				conn_cmd=(curl --data-binary @- --insecure --max-time "$PROTOCOL_TIMEOUT_S" -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:${connect_port:-80}/.well-known/wg-autoconf/")
 			fi
 			
 			section=""
