@@ -332,6 +332,20 @@ array_contains()
 	done
 	return 1
 }
+emit_server_event()
+{
+	__emit_server_event_interface="$1"
+	__emit_server_event_event="$2"
+	shift 2
+	for f in "/etc/wg-server@$__emit_server_event_interface.d/$__emit_server_event_event/"*
+	do
+		if [ -f "$f" ] && [ -x "$f" ]
+		then
+			# execute script
+			WG_AUTOCONF="$0" WG_AUTOCONF_INTERFACE="$__emit_server_event_interface" WG_AUTOCONF_EVENT="$__emit_server_event_event" "$f" "$@"
+		fi
+	done
+}
 
 
 print_usage()
@@ -931,6 +945,7 @@ context_conf()
 		peer_AllowedIPs=()
 		peer_PersistentKeepalive=""
 		peer_Type=""
+		peer_VirtualEndpoint=""
 		
 		section_buffer=()
 		section=""
@@ -966,6 +981,7 @@ context_conf()
 			[ -z "$peer_Type" ] || printf '%s\n' "Type = $peer_Type"
 			[ -z "$peer_PublicKey" ] || printf '%s\n' "PublicKey = $peer_PublicKey"
 			[ -z "$peer_Endpoint" ] || printf '%s\n' "Endpoint = $peer_Endpoint"
+			[ -z "$peer_VirtualEndpoint" ] || printf '%s\n' "VirtualEndpoint = $peer_VirtualEndpoint"
 			if [ "${#peer_AllowedIPs[@]}" -gt 0 ]
 			then
 				for allowed_ip in "${peer_AllowedIPs[@]}"
@@ -1059,6 +1075,14 @@ context_conf()
 				then
 					[ -z "$peer_Endpoint" ] || printf '%s\t%s\n' "$peer_PublicKey" "$peer_Endpoint"
 				
+				elif [ "$1" = "VirtualEndpoint" ]
+				then
+					[ -z "$peer_VirtualEndpoint" ] || printf '%s\t%s\n' "$peer_PublicKey" "$peer_VirtualEndpoint"
+
+				elif [ "$1" = "VirtualHostname" ]
+				then
+					[ -z "$peer_VirtualHostname" ] || printf '%s\t%s\n' "$peer_PublicKey" "$peer_VirtualHostname"
+
 				elif [ "$1" = "Type" ]
 				then
 					[ -z "$peer_Type" ] || printf '%s\t%s\n' "$peer_PublicKey" "$peer_Type"
@@ -1146,6 +1170,12 @@ context_conf()
 					Endpoint)
 						[ -z "$peer_Endpoint" ] || printf '%s\n' "$peer_Endpoint"
 					;;
+					VirtualEndpoint)
+						[ -z "$peer_VirtualEndpoint" ] || printf '%s\n' "$peer_VirtualEndpoint"
+					;;
+					VirtualHostname)
+						[ -z "$peer_VirtualHostname" ] || printf '%s\n' "$peer_VirtualHostname"
+					;;
 					Type)
 						[ -z "$peer_Type" ] || printf '%s\n' "$peer_Type"
 					;;
@@ -1232,10 +1262,14 @@ context_conf()
 					
 					set_peer_Type=false
 					set_peer_Endpoint=false
+					set_peer_VirtualEndpoint=false
+					set_peer_VirtualHostname=false
 					set_peer_AllowedIPs=false
 					set_peer_PersistentKeepalive=false
 					new_peer_Type=""
 					new_peer_Endpoint=""
+					new_peer_VirtualEndpoint=""
+					new_peer_VirtualHostname=""
 					new_peer_AllowedIPs=()
 					new_peer_PersistentKeepalive=""
 					
@@ -1305,6 +1339,14 @@ context_conf()
 												set_peer_Endpoint=true
 												read -r new_peer_Endpoint <<<"$value"
 											;;
+											virtualendpoint)
+												set_peer_VirtualEndpoint=true
+												read -r new_peer_VirtualEndpoint <<<"$value"
+											;;
+											virtualhostname)
+												set_peer_VirtualHostname=true
+												read -r new_peer_VirtualHostname <<<"$value"
+											;;
 											allowedips)
 												set_peer_AllowedIPs=true
 												split ',' "$value" new_peer_AllowedIPs
@@ -1371,6 +1413,14 @@ context_conf()
 											set_peer_Endpoint=true
 											read -r new_peer_Endpoint <<<"${stdin_line#*=}"
 										;;
+										VirtualEndpoint=*)
+											set_peer_VirtualEndpoint=true
+											read -r new_peer_VirtualEndpoint <<<"${stdin_line#*=}"
+										;;
+										VirtualHostname=*)
+											set_peer_VirtualHostname=true
+											read -r new_peer_VirtualHostname <<<"${stdin_line#*=}"
+										;;
 										AllowedIPs=*)
 											set_peer_AllowedIPs=true
 											split ',' "${stdin_line#*=}" new_peer_AllowedIPs
@@ -1398,6 +1448,7 @@ context_conf()
 						then
 							# remove Endpoints (a client cannot be reached externally per our definition)
 							peer_Endpoint=""
+							peer_VirtualEndpoint=""
 							# remove any non-128-bitmask addresses
 							if ! $set_peer_AllowedIPs
 							then
@@ -1428,6 +1479,19 @@ context_conf()
 						else
 							peer_Endpoint="$new_peer_Endpoint"
 						fi
+					fi
+					if $set_peer_VirtualEndpoint
+					then
+						if [ "$peer_Type" = "client" ] && [ -n "$new_peer_VirtualEndpoint" ]
+						then
+							echo "warning: VirtualEndpoint not allowed for [Peer] Type = client." >&2
+						else
+							peer_VirtualEndpoint="$new_peer_VirtualEndpoint"
+						fi
+					fi
+					if $set_peer_VirtualHostname
+					then
+						peer_VirtualHostname="$new_peer_VirtualHostname"
 					fi
 					if $set_peer_AllowedIPs
 					then
@@ -1584,6 +1648,14 @@ context_conf()
 							parsed=true
 							read -r peer_Endpoint <<<"${line#*=}"
 						;;
+						VirtualEndpoint=*)
+							parsed=true
+							read -r peer_VirtualEndpoint <<<"${line#*=}"
+						;;
+						VirtualHostname=*)
+							parsed=true
+							read -r peer_VirtualHostname <<<"${line#*=}"
+						;;
 						AllowedIPs=*)
 							parsed=true
 							split ',' "${line#*=}" peer_AllowedIPs
@@ -1622,6 +1694,79 @@ context_conf()
 	) 200<"$conf_file" || exit $?
 }
 
+context_protocol()
+{
+	opts_command="$1"
+	shift
+	
+	case "$opts_command" in
+		connect)
+			connect_host="$1"
+			connect_port="$2"
+			
+			# support for both host:port and host port in one combined argument or two separate arguments
+			if [ -z "$connect_port" ]
+			then
+				# extract port from host (with IPv6 detection)
+				case "$connect_host" in
+					\[*\]:*)
+						connect_port="${connect_host##*:}"
+						connect_host="${connect_host%:*}"
+					;;
+					*:*:*)
+						# IPv6 address without port
+					;;
+					*:*)
+						connect_port="${connect_host##*:}"
+						connect_host="${connect_host%:*}"
+					;;
+				esac
+			fi
+			
+			# if IPv6, wrap IPv6 in square brackets, unless it is already wrapped
+			read -r connect_host < <(ensure_ipv6_brackets "$connect_host")
+			
+			if [ -z "$connect_port" ]
+			then
+				echo "info: Connecting to: $connect_host... Port defaults to first checking HTTP-port (:80), with fallback at :$WIREGUARD_PORT" >&2
+			else
+				echo "info: Connecting to: $connect_host:$connect_port..." >&2
+			fi
+			
+			conn_cmd=(socat -t"$PROTOCOL_TIMEOUT_S" - tcp:"$connect_host":"${connect_port:-$WIREGUARD_PORT}")
+			if is_http "$connect_host" "${connect_port:-80}"
+			then
+				conn_cmd=(curl --data-binary @- --insecure --max-time "$PROTOCOL_TIMEOUT_S" -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:${connect_port:-80}/.well-known/wg-autoconf/")
+			fi
+			
+			exec "${conn_cmd[@]}"
+		;;
+		listen)
+			listen_port="$1"
+			shift
+			if [ "$1" = "execute" ]
+			then
+				# skip over 'execute' as more readable call
+				shift
+			fi
+
+			tcp_listen="tcp-listen"
+			if [ "${opts_bind_host:0:1}" = "[" ]
+			then
+				tcp_listen="tcp6-listen"
+			fi
+			
+			if ! is_num "$listen_port"
+			then
+				echo "error: Invalid listen port ($listen_port). Check configuration." >&2
+				exit 1
+			fi
+			
+			socat -t"$PROTOCOL_TIMEOUT_S" "$tcp_listen":"$listen_port",bind="$opts_bind_host",reuseaddr,fork system:"$*"
+		;;
+	esac
+	
+}
 
 context_client()
 {
@@ -1658,32 +1803,6 @@ EOF
 		connect)
 			connect_host="$1"
 			connect_port="$2"
-			
-			# support for both host:port and host port in one combined argument or two separate arguments
-			if [ -z "$connect_port" ]
-			then
-				# extract port from host (with IPv6 detection)
-				case "$connect_host" in
-					\[*\]:*)
-						connect_port="${connect_host##*:}"
-						connect_host="${connect_host%:*}"
-					;;
-					*:*:*)
-						# IPv6 address without port
-					;;
-					*:*)
-						connect_port="${connect_host##*:}"
-						connect_host="${connect_host%:*}"
-					;;
-				esac
-			fi
-			#if [ -z "$connect_port" ]
-			#then
-			#	connect_port="$WIREGUARD_PORT"
-			#fi
-			
-			# if IPv6, wrap IPv6 in square brackets, unless it is already wrapped
-			read -r connect_host < <(ensure_ipv6_brackets "$connect_host")
 			
 			if [ -n "$opts_mac_address" ] && [ "$opts_mac_address" != "auto" ]
 			then
@@ -1722,12 +1841,9 @@ EOF
 				fi
 			fi
 			
-			if [ -z "$connect_port" ]
-			then
-				echo "info: Connecting to: $connect_host... Port defaults to first checking HTTP-port (:80), with fallback at :$WIREGUARD_PORT"
-			else
-				echo "info: Connecting to: $connect_host:$connect_port..."
-			fi
+			# use local hostname
+			read -r local_VirtualHostname < <(hostname)
+			
 			echo "info: Local public key: $local_PublicKey"
 			
 			remote_PublicKey=""
@@ -1737,12 +1853,6 @@ EOF
 			remote_PrefixMask=""
 			
 			client_Address=""
-			
-			conn_cmd=(socat -t"$PROTOCOL_TIMEOUT_S" - tcp:"$connect_host":"${connect_port:-$WIREGUARD_PORT}")
-			if is_http "$connect_host" "${connect_port:-80}"
-			then
-				conn_cmd=(curl --data-binary @- --insecure --max-time "$PROTOCOL_TIMEOUT_S" -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:${connect_port:-80}/.well-known/wg-autoconf/")
-			fi
 			
 			section=""
 			while read -r line || { socat_exit_code="$line" && break; }
@@ -1794,11 +1904,12 @@ EOF
 						esac
 					;;
 				esac
-			done < <("${conn_cmd[@]}" < <(
+			done < <("$0" protocol connect "$connect_host" "$connect_port" < <(
 					sock_send "[Peer]"
 					sock_send "Type = client"
 					sock_send "PublicKey = $local_PublicKey"
 					[ -z "$local_InterfaceID" ] || sock_send "InterfaceID = $local_InterfaceID"
+					[ -z "$local_VirtualHostname" ] || sock_send "VirtualHostname = $local_VirtualHostname"
 					sock_send ""
 				)
 				echo -n "$?"
@@ -2080,14 +2191,142 @@ EOF
 	
 	# fallback to current hostname (this is probably the best default behavior that should not be stored in the configuration file explicitly unless done so manually)
 	[ -n "$local_Endpoint" ] || read -r local_Endpoint < <(hostname)
-	
+
+	# if Endpoint is set, add port to it, because it is mandatory to have a port in the [Peer]-section that we'll send
+	public_Endpoint=""
+	if [ -n "$local_Endpoint" ]
+	then
+		# add missing square brackets to a loose IPv6 address (without port)
+		read -r public_Endpoint < <(ensure_ipv6_brackets "$local_Endpoint")
+		
+		# add missing port argument (an Endpoint and ServerEndpoint in [Peer] must have a port, however, in the [Interface]-section it should be left out, since ListenPort must be set to the same port anyway)
+		case "$public_Endpoint" in
+			\[*\]) # is ipv6-address
+				public_Endpoint="$public_Endpoint:$local_ListenPort"
+			;;
+			*:*) ;; # is host:port definition
+			*)
+				public_Endpoint="$public_Endpoint:$local_ListenPort"
+			;;
+		esac
+	fi
 	
 	# grab local_PrefixMask
 	read -r local_PrefixMask < <("$0" "$opts_interface" conf get-interface PrefixMask) || true
 	[ -n "$local_PrefixMask" ] || local_PrefixMask="$DEFAULT_VPN_PREFIX_MASK"
 	
-	
 	case "$opts_command" in
+		get-public-key)
+			echo "$local_PublicKey"
+		;;
+		get-public-endpoint)
+			echo "$public_Endpoint"
+		;;
+		list-virtual-endpoints)
+			# print VirtualEndpoint of each server
+			# if missing, print the AllowedIPs first value, with the port of Endpoint, which is a good default value
+			# this kind of message, can also allow one server to update the configuration of another server
+			# except the AllowedIPs is allowed to be set the first time, through the public Endpoint, to allow for initial connection
+			
+			# list virtual endpoints, that is just the first AllowedIPs for each public key, with the Endpoint's port
+			server_PublicKey=""
+			server_VirtualEndpoint=""
+			server_FirstAllowedIP=""
+			server_Endpoint=""
+			
+			print_server()
+			{
+				if [ -z "$server_VirtualEndpoint" ]
+				then
+					server_VirtualEndpoint="${server_FirstAllowedIP%%/*}"
+					server_VirtualEndpoint="${server_VirtualEndpoint%%\$*}"
+					read -r server_VirtualEndpoint < <(ensure_ipv6_brackets "$server_VirtualEndpoint")
+					
+					virtual_port=""
+					case "$server_Endpoint" in
+						\[*\]:*)
+							virtual_port="${server_Endpoint##*:}"
+						;;
+						*:*:*)
+							# IPv6 address without port
+						;;
+						*:*)
+							virtual_port="${server_Endpoint##*:}"
+						;;
+					esac
+					if [ -n "$virtual_port" ]
+					then
+						server_VirtualEndpoint="${server_VirtualEndpoint}:${virtual_port}"
+					fi
+				fi
+				
+				if [ -n "$server_VirtualEndpoint" ]
+				then
+					echo -e "$server_PublicKey\t$server_VirtualEndpoint"
+				fi
+			}
+			
+			section=""
+			while read -r line
+			do
+				# grab the VirtualEndpoint
+				# if not exists, we should print instead the first AllowedIPs line
+				# with the port of Endpoint (or leave out if no port defined there)
+				
+				# parse section name
+				case "$line" in
+					\[*)
+						section="${line%%]*}"
+						section="${section##*[}"
+						
+						print_server
+						
+						server_PublicKey=""
+						server_VirtualEndpoint=""
+						server_FirstAllowedIP=""
+						server_Endpoint=""
+						continue
+					;;
+				esac
+				
+				case "$section" in
+					Peer)
+						case "${line// /}" in
+							PublicKey=*)
+								read -r server_PublicKey <<<"${line#*=}"
+							;;
+							VirtualEndpoint=*)
+								read -r server_VirtualEndpoint <<<"${line#*=}"
+							;;
+							AllowedIPs=*)
+								if [ -z "$server_FirstAllowedIP" ]
+								then
+									read -r server_FirstAllowedIP <<<"${line#*=}"
+								fi
+							;;
+							Endpoint=*)
+								read -r server_Endpoint <<<"${line#*=}"
+							;;
+						esac
+					;;
+				esac
+				
+			done < <("$0" "$opts_interface" conf list-servers)
+			
+			print_server
+		;;
+		send-message)
+			# send a message to a server in the pool, given by the host
+			# address must include both host and port
+			target_address="$1"
+			
+			"$0" "$opts_interface" protocol connect "$target_address" <<EOF
+Type=server
+PublicKey=$local_PublicKey
+Message=$2
+Data=$3
+EOF
+		;;
 		connect)
 			connect_host="$1"
 			connect_port="$2"
@@ -2155,24 +2394,6 @@ EOF
 			
 			# fallback to opts
 			[ "${#local_Address[@]}" -ne 0 ] || local_Address=("$opts_vpn_address")
-			
-			# if Endpoint is set, add port to it, because it is mandatory to have a port in the [Peer]-section that we'll send
-			if [ -n "$local_Endpoint" ]
-			then
-				# add missing square brackets to a loose IPv6 address (without port)
-				read -r local_Endpoint < <(ensure_ipv6_brackets "$local_Endpoint")
-				
-				# add missing port argument (an Endpoint and ServerEndpoint in [Peer] must have a port, however, in the [Interface]-section it should be left out, since ListenPort must be set to the same port anyway)
-				case "$local_Endpoint" in
-					\[*\]) # is ipv6-address
-						local_Endpoint="$local_Endpoint:$local_ListenPort"
-					;;
-					*:*) ;; # is host:port definition
-					*)
-						local_Endpoint="$local_Endpoint:$local_ListenPort"
-					;;
-				esac
-			fi
 			
 			# give PublicKey, telling how to securely connect with us
 			# give Endpoint, telling how to reach us
@@ -2249,7 +2470,7 @@ EOF
 					sock_send "Type = Server"
 					sock_send "PublicKey = $local_PublicKey"
 					sock_send "Address = $local_AddressLine"
-					sock_send "Endpoint = $local_Endpoint"
+					sock_send "Endpoint = $public_Endpoint"
 					sock_send "PrefixMask = $local_PrefixMask"
 					sock_send ""
 				); echo -n "$?")
@@ -2406,25 +2627,33 @@ EOF
 				echo "error: Invalid listen port (ListenPort = $local_ListenPort). Check configuration."
 				exit 1
 			fi
+
+			emit_server_event "$opts_interface" "listening" "$opts_bind_host" "$local_ListenPort"
 			
-			socat -t"$PROTOCOL_TIMEOUT_S" "$tcp_listen":"$local_ListenPort",bind="$opts_bind_host",reuseaddr,fork system:"${cmd[*]}"
+			"$0" --bind "$opts_bind_host" "$opts_interface" protocol listen "$local_ListenPort" execute "${cmd[*]}"
 		;;
 		accept)
 			local_PublicKey="$1"
+			read -r sock_addr < <(expand_ipv6 "$SOCAT_PEERADDR")
 			
 			[ "$opts_verbosity" -ge 1 ] && echo "info: Remote[]: Connected." >&2
 			[ "$opts_verbosity" -ge 1 ] && trap 'echo "info: Remote[$remote_PublicKey]: Disconnected." >&2' EXIT
 			
 			# peer can send:
 			remote_PublicKey=""      # the remote Peer's PublicKey (mandatory)
-			remote_Type=""           # remote Type: client or server (optional)
+			remote_Type=""           # remote Type: client or server (optional), defaults to client
+			remote_Message=""        # trigger a certain message notification (only if peer_Type is found to be "server"), and the connection is through the local virtual network, and the IP-address matches
+			remote_Data=""
 			# in case of client:
-			remote_InterfaceID=""    # the MAC-address or some other preferred unique identifier of this client (optional)
+			remote_InterfaceID=""     # the MAC-address or some other preferred unique identifier of this client (optional)
+			remote_VirtualHostname="" # the hostname that this device identifies itself by, server may or may not use this (optional)
 			# in case of server:
-			remote_Address=()        # how to reach the server directly, and a mask specifying which clients it can also support, and $[0-9]+ for a cost metric for relaying servers (mandatory)
-			remote_Endpoint=""       # how to reach this server from outside (optional, but sort of mandatory if server, otherwise the connection is only half)
-			remote_PrefixMask=""     # ensure the remote PrefixMask matches the local PrefixMask, otherwise no connection should occur
+			remote_Address=()         # how to reach the server directly, and a mask specifying which clients it can also support, and $[0-9]+ for a cost metric for relaying servers (mandatory)
+			remote_Endpoint=""        # how to reach this server from outside (optional, but sort of mandatory if server, otherwise the connection is only half)
+			remote_VirtualEndpoint="" # how to reach this server from inside the tunnel
+			remote_PrefixMask=""      # ensure the remote PrefixMask matches the local PrefixMask, otherwise no connection should occur
 			set_remote_Endpoint=false
+			set_remote_VirtualEndpoint=false
 			
 			while read -t "$PROTOCOL_TIMEOUT_S" -r line
 			do
@@ -2447,8 +2676,18 @@ EOF
 						set_remote_Endpoint=true
 						read -r remote_Endpoint <<<"${line#*=}"
 					;;
+					VirtualEndpoint=*)
+						set_remote_VirtualEndpoint=true
+						read -r remote_VirtualEndpoint <<<"${line#*=}"
+					;;
+					VirtualHostname=*)
+						read -r remote_VirtualHostname <<<"${line#*=}"
+					;;
 					PrefixMask=*)
 						read -r remote_PrefixMask <<<"${line#*=}"
+					;;
+					Value=*)
+						read -r remote_Value <<< "${line#*=}"
 					;;
 				esac
 				
@@ -2458,6 +2697,12 @@ EOF
 			then
 				echo "warn: Remote[$remote_PublicKey]: Bad protocol. PublicKey not given." >&2
 				sock_send "Error = 401 Unauthorized (no PublicKey in request)"
+				if [ "$remote_Type" = "server" ]
+				then
+					emit_server_event "$opts_interface" "server-rejected" "" "401" "Unauthorized (no PublicKey in request)"
+				else
+					emit_server_event "$opts_interface" "client-rejected" "" "401" "Unauthorized (no PublicKey in request)"
+				fi
 				exit 41
 			fi
 			
@@ -2481,6 +2726,12 @@ EOF
 				echo "warn: Remote[$remote_PublicKey]: Not authorized (PublicKey = $remote_PublicKey). To authorize, run: $0 server allow $remote_PublicKey" >&2
 				sock_send "Error = 403 Forbidden"
 				sock_send_lines "${interface_block[@]}"
+				if [ "$remote_Type" = "server" ]
+				then
+					emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "403" "Forbidden"
+				else
+					emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "403" "Forbidden"
+				fi
 				exit 43
 			fi
 			
@@ -2488,6 +2739,8 @@ EOF
 			peer_Type=""
 			peer_AllowedIPs=()
 			peer_Endpoint=""
+			peer_VirtualEndpoint=""
+			peer_VirtualHostname=""
 			peer_PersistentKeepalive=""
 			
 			while read -r line
@@ -2505,6 +2758,15 @@ EOF
 						# autodetected server-type, but don't overwrite if already set
 						[ -z "$peer_Endpoint" ] || [ -n "$peer_Type" ] || peer_Type="server"
 					;;
+					VirtualEndpoint=*)
+						read -r peer_VirtualEndpoint <<<"${line#*=}"
+						
+						# autodetected server-type, but don't overwrite if already set
+						[ -z "$peer_VirtualEndpoint" ] || [ -n "$peer_Type" ] || peer_Type="server"
+					;;
+					VirtualHostname=*)
+						read -r peer_VirtualHostname <<<"${line#*=}"
+					;;
 					AllowedIPs=*)
 						split ',' "${line#*=}" peer_AllowedIPs
 						
@@ -2520,6 +2782,44 @@ EOF
 				esac
 			done <<<"$peer_info"
 			
+			# check if peer_AllowedIPs matches the address from which this socket is coming from
+			# that means, that sock_authenticated will be true, if the virtual address matches
+			sock_authenticated=false
+			for allowed_ip in "${peer_AllowedIPs[@]}"
+			do
+				allowed_ip="${allowed_ip%%/*}"
+				allowed_ip="${allowed_ip%%\$*}"
+				read -r norm_allowed_ip < <(expand_ipv6 "$allowed_ip")
+				
+				if [ "$norm_allowed_ip" = "$sock_addr" ]
+				then
+					# check if the allowed_ip matches the sock_addr, if so, then sock_authenticated=true
+					sock_authenticated=true
+				fi
+			done
+			
+			if [ -n "$remote_Message" ]
+			then
+				if $sock_authenticated
+				then
+					echo "info: Remote[$remote_PublicKey]: Received message from ${peer_Type:-client}: $remote_Message with data: $remote_Data" >&2
+					emit_server_event "$opts_interface" "${peer_Type:-client}-notification" "$remote_PublicKey" "$remote_Message" "$remote_Data"
+					exit 0
+				else
+					echo "error: Remote[$remote_PublicKey]: Received unauthenticated message from ${peer_Type:-client}: $remote_Message." >&2
+					sock_send "Error = 403 Forbidden"
+					exit 43
+				fi
+				
+			elif [ "$peer_Type" = "server" ] || [ "$remote_Type" = "server" ]
+			then
+				emit_server_event "$opts_interface" "server-connected" "$remote_PublicKey"
+
+			else
+				emit_server_event "$opts_interface" "client-connected" "$remote_PublicKey"
+			fi
+			
+			
 			if [ "$peer_Type" = "server" ]
 			then
 				if [ -z "$remote_PrefixMask" ]
@@ -2533,14 +2833,26 @@ EOF
 					echo "error: Remote[$remote_PublicKey]: PrefixMask configuration mismatch. Remote PrefixMask ($remote_PrefixMask) does not match local PrefixMask ($local_PrefixMask)." >&2
 					sock_send "Error = 400 Bad Request"
 					sock_send_lines "${interface_block[@]}"
+					# event-name, peer-public-key, code, message
+					emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "400" "PrefixMask configuration mismatch. Remote PrefixMask ($remote_PrefixMask) does not match local PrefixMask ($local_PrefixMask)."
 					exit 40
 				fi
 				
-				# peer is an authorized server, connecting with us again
+				# peer is an authorized server, connecting with us again (although it could be anyone, who has the server's public key!)
+				# so if the peer already exists with this public key, and has new settings, then it MUST be connecting through the virtual network
+				# instead of using the public endpoint
 				lines=()
 				
+				# check if server is authenticated
+				new_or_auth=$sock_authenticated
+				# if not authenticated, check if server is registering for the first time (no AllowedIPs set yet)
+				if ! $new_or_auth && [ -z "${peer_AllowedIPs[*]}" ]
+				then
+					new_or_auth=true
+				fi
+				
 				# Address was received, and Address differs from AllowedIPs
-				if [ "${#remote_Address[@]}" -gt 0 ] && [ "${peer_AllowedIPs[*]}" != "${remote_Address[*]}" ]
+				if $new_or_auth && [ "${#remote_Address[@]}" -gt 0 ] && [ "${peer_AllowedIPs[*]}" != "${remote_Address[*]}" ]
 				then
 					# combine server_Address to one line:
 					read -r remote_AddressLine < <(join ', ' "${remote_Address[@]}")
@@ -2549,14 +2861,21 @@ EOF
 				fi
 				
 				# Endpoint was received, and Endpoint differs from Endpoint
-				if $set_remote_Endpoint && [ "$remote_Endpoint" != "$peer_Endpoint" ]
+				if $new_or_auth && $set_remote_Endpoint && [ "$remote_Endpoint" != "$peer_Endpoint" ]
 				then
 					# the connecting peer is responsible for adding its own ListenPort to the Endpoint address
 					lines+=("Endpoint = $remote_Endpoint")
 				fi
 				
+				# VirtualEndpoint was received, and VirtualEndpoint differs from VirtualEndpoint
+				if $new_or_auth && $set_remote_VirtualEndpoint && [ "$remote_VirtualEndpoint" != "$peer_VirtualEndpoint" ]
+				then
+					# the connecting peer is responsible for adding its own ListenPort to the VirtualEndpoint address
+					lines+=("VirtualEndpoint = $remote_VirtualEndpoint")
+				fi
+				
 				# Ensure PersistentKeepalive is set to our current options (in case [Peer] will be created for the first time, or configuration was manually changed)
-				if [ "$peer_PersistentKeepalive" != "$opts_persistent_keepalive_s" ]
+				if $new_or_auth && [ "$peer_PersistentKeepalive" != "$opts_persistent_keepalive_s" ]
 				then
 					lines+=("PersistentKeepalive = $opts_persistent_keepalive_s")
 				fi
@@ -2564,6 +2883,10 @@ EOF
 				# if any new lines need to be added
 				if [ "${#lines[@]}" -gt 0 ]
 				then
+					# only update existing peer
+					# if AllowedIPs, and AllowedIPs does not exist yet
+					# if Endpoint, and Endpoint does not exist yet, OR, connected socket matches AllowedIPs
+
 					# update configuration file
 					if "$0" "$opts_interface" conf set-peer "$remote_PublicKey" < <(
 						echo "[Peer]"
@@ -2580,22 +2903,22 @@ EOF
 						echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						sock_send "Error = 500 Internal Server Error"
 						sock_send_lines "${interface_block[@]}"
+						emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "500" "Failed to update configuration for Peer ($remote_PublicKey)."
 						exit 50
 					fi
 				fi
 				
-			else
-				
-				if [ "$remote_Type" = "server" ]
-				then
-					# this server wants to connect as a server, but it is not allowed as a server here
-					# that is an error
-					echo "warn: Remote[$remote_PublicKey]: Client wants to connect as a server, but is not authorized as a server. To authorize client as a server, run: $0 server allow $remote_PublicKey <<<Type=server" >&2
-					sock_send "Error = 403 Forbidden (not authorized as server)"
-					sock_send_lines "${interface_block[@]}"
-					exit 43
-				fi
-				
+			elif [ "$remote_Type" = "server" ]
+			then
+				# this server wants to connect as a server, but it is not allowed as a server here
+				# that is an error
+				echo "warn: Remote[$remote_PublicKey]: Client wants to connect as a server, but is not authorized as a server. To authorize client as a server, run: $0 server allow $remote_PublicKey <<<Type=server" >&2
+				sock_send "Error = 403 Forbidden (not authorized as server)"
+				sock_send_lines "${interface_block[@]}"
+				emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "403" "Client wants to connect as a server, but is not authorized as a server."
+				exit 43
+
+			else # assume Type=client
 				local_AddressMask=""
 				local_AddressPrefix=""
 				for address in "${local_Address[@]}"
@@ -2627,6 +2950,7 @@ EOF
 					echo "error: Remote[$remote_PublicKey]: Local server is not currently a server (no Address mask has been specified, check configuration)." >&2
 					sock_send "Error = 503 Service Unavailable (invalid server configuration)"
 					sock_send_lines "${interface_block[@]}"
+					emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "503" "Local server is not currently a server (no Address mask has been specified, check configuration)."
 					exit 53
 				fi
 				
@@ -2760,6 +3084,7 @@ EOF
 						echo "error: Remote[$remote_PublicKey]: Address space exhausted, too many clients ($count)." >&2
 						sock_send "Error = 507 Insufficient Storage (address space exhausted, too many clients)"
 						sock_send_lines "${interface_block[@]}"
+						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "507" "Address space exhausted, too many clients ($count)."
 						exit 57
 					fi
 				fi
@@ -2776,6 +3101,7 @@ EOF
 						echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it already exists in the configuration as an Address or AllowedIPs ($conf_file)." >&2
 						sock_send "Error = 409 Conflict (forbidden address: $client_addr, not unique)"
 						sock_send_lines "${interface_block[@]}"
+						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it already exists in the configuration as an Address or AllowedIPs ($conf_file)."
 						exit 49
 					fi
 					
@@ -2784,6 +3110,7 @@ EOF
 							echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it ends with :: or :0." >&2
 							sock_send "Error = 409 Conflict (forbidden address: $client_addr, ends with :: or :0)"
 							sock_send_lines "${interface_block[@]}"
+							emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it ends with :: or :0."
 							exit 49
 						;;
 						"$local_AddressPrefix"*) ;; # this is correct, client_addr should be in the subnet of this server
@@ -2791,24 +3118,40 @@ EOF
 							echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it does not start with the server prefix ($local_AddressPrefix)." >&2
 							sock_send "Error = 409 Conflict (forbidden address: $client_addr, bad prefix)"
 							sock_send_lines "${interface_block[@]}"
+							emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it does not start with the server prefix ($local_AddressPrefix)."
 							exit 49
 						;;
 					esac
 					
+					# check if a peer_VirtualHostname already exists
+					auto_hostname_line=""
+					if [ -n "$remote_VirtualHostname" ] && [ -z "$peer_VirtualHostname" ] && [ "$remote_VirtualHostname" != "localhost" ]
+					then
+						# now check if remote_VirtualHostname doesn't already exist (it must be unique, and unused, also as a public DNS)
+						if ! getent hosts "$remote_VirtualHostname" >/dev/null 2>/dev/null
+						then
+							auto_hostname_line="VirtualHostname = $remote_VirtualHostname"
+						fi
+					fi
+
 					# check if client_addr is unique (must be done by set-peer, for atomic locking purposes)
 					if "$0" "$opts_interface" conf set-peer "$remote_PublicKey" >&2 <<EOF
 Type = client
 AllowedIPs = $client_addr
+$auto_hostname_line
 EOF
 					then
 						echo "info: Remote[$remote_PublicKey]: Configuration updated. Peer (PublicKey = $remote_PublicKey) added with virtual IP-address: $client_addr" >&2
 						
 						# refresh Wireguard configuration
 						"$0" "$opts_interface" update "$opts_interface" >&2
+						
+						emit_server_event "$opts_interface" "client-updated" "$remote_PublicKey" "$client_addr"
 					else
 						echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						sock_send "Error = 500 Internal Server Error"
 						sock_send_lines "${interface_block[@]}"
+						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "500" "Failed to update configuration for Peer ($remote_PublicKey)."
 						exit 50
 					fi
 				fi
@@ -2888,6 +3231,13 @@ EOF
 				sock_send "$line"
 				
 			done < <("$0" "$opts_interface" conf get-peer "$remote_PublicKey")
+			
+			if [ "$peer_Type" = "server" ]
+			then
+				emit_server_event "$opts_interface" "server-accepted" "$remote_PublicKey"
+			else
+				emit_server_event "$opts_interface" "client-accepted" "$remote_PublicKey"
+			fi
 		;;
 		*)
 			echo "error: Invalid server command ($opts_command)." >&2
@@ -3152,6 +3502,9 @@ case "$opts_context" in
 	;;
 	conf)
 		context_conf "$@"
+	;;
+	protocol)
+		context_protocol "$@"
 	;;
 	client)
 		context_client "$@"
