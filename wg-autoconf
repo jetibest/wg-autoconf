@@ -2714,7 +2714,7 @@ EOF
 			[ -z "$local_ListenPort" ] || interface_block+=("ListenPort = $local_ListenPort")
 			
 			# grab Endpoint and print if exists, it should be the public address of this server, possibly DNS with round-robin
-			[ -z "$local_Endpoint" ] || interface_block+=("Endpoint = $local_Endpoint")
+			[ -z "$public_Endpoint" ] || interface_block+=("Endpoint = $public_Endpoint")
 			
 			# show the PrefixMask
 			interface_block+=("PrefixMask = $local_PrefixMask")
