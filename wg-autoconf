@@ -1904,7 +1904,7 @@ EOF
 						esac
 					;;
 				esac
-			done < <("$0" protocol connect "$connect_host" "$connect_port" < <(
+			done < <("$0" "$opts_interface" protocol connect "$connect_host" "$connect_port" < <(
 					sock_send "[Peer]"
 					sock_send "Type = client"
 					sock_send "PublicKey = $local_PublicKey"
