@@ -342,6 +342,7 @@ emit_server_event()
 		if [ -f "$f" ] && [ -x "$f" ]
 		then
 			# execute script
+			echo "info: Emit server event: $f $*"
 			WG_AUTOCONF="$0" WG_AUTOCONF_INTERFACE="$__emit_server_event_interface" WG_AUTOCONF_EVENT="$__emit_server_event_event" "$f" "$@"
 		fi
 	done
@@ -2686,8 +2687,11 @@ EOF
 					PrefixMask=*)
 						read -r remote_PrefixMask <<<"${line#*=}"
 					;;
-					Value=*)
-						read -r remote_Value <<< "${line#*=}"
+					Message=*)
+						read -r remote_Message <<< "${line#*=}"
+					;;
+					Data=*)
+						read -r remote_Data <<< "${line#*=}"
 					;;
 				esac
 				
