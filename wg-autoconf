@@ -2807,7 +2807,7 @@ EOF
 				if $sock_authenticated
 				then
 					echo "info: Remote[$remote_PublicKey]: Received message from ${peer_Type:-client}: $remote_Message with data: $remote_Data" >&2
-					emit_server_event "$opts_interface" "${peer_Type:-client}-notification" "$remote_PublicKey" "$remote_Message" "$remote_Data" >&2
+					emit_server_event "$opts_interface" "${peer_Type:-client}-message" "$remote_PublicKey" "$remote_Message" "$remote_Data" >&2
 					exit 0
 				else
 					echo "error: Remote[$remote_PublicKey]: Received unauthenticated message from ${peer_Type:-client}: $remote_Message." >&2
