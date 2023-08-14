@@ -2699,9 +2699,9 @@ EOF
 				sock_send "Error = 401 Unauthorized (no PublicKey in request)"
 				if [ "$remote_Type" = "server" ]
 				then
-					emit_server_event "$opts_interface" "server-rejected" "" "401" "Unauthorized (no PublicKey in request)"
+					emit_server_event "$opts_interface" "server-rejected" "" "401" "Unauthorized (no PublicKey in request)" >&2
 				else
-					emit_server_event "$opts_interface" "client-rejected" "" "401" "Unauthorized (no PublicKey in request)"
+					emit_server_event "$opts_interface" "client-rejected" "" "401" "Unauthorized (no PublicKey in request)" >&2
 				fi
 				exit 41
 			fi
@@ -2728,9 +2728,9 @@ EOF
 				sock_send_lines "${interface_block[@]}"
 				if [ "$remote_Type" = "server" ]
 				then
-					emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "403" "Forbidden"
+					emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "403" "Forbidden" >&2
 				else
-					emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "403" "Forbidden"
+					emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "403" "Forbidden" >&2
 				fi
 				exit 43
 			fi
@@ -2803,7 +2803,7 @@ EOF
 				if $sock_authenticated
 				then
 					echo "info: Remote[$remote_PublicKey]: Received message from ${peer_Type:-client}: $remote_Message with data: $remote_Data" >&2
-					emit_server_event "$opts_interface" "${peer_Type:-client}-notification" "$remote_PublicKey" "$remote_Message" "$remote_Data"
+					emit_server_event "$opts_interface" "${peer_Type:-client}-notification" "$remote_PublicKey" "$remote_Message" "$remote_Data" >&2
 					exit 0
 				else
 					echo "error: Remote[$remote_PublicKey]: Received unauthenticated message from ${peer_Type:-client}: $remote_Message." >&2
@@ -2813,10 +2813,10 @@ EOF
 				
 			elif [ "$peer_Type" = "server" ] || [ "$remote_Type" = "server" ]
 			then
-				emit_server_event "$opts_interface" "server-connected" "$remote_PublicKey"
+				emit_server_event "$opts_interface" "server-connected" "$remote_PublicKey" >&2
 
 			else
-				emit_server_event "$opts_interface" "client-connected" "$remote_PublicKey"
+				emit_server_event "$opts_interface" "client-connected" "$remote_PublicKey" >&2
 			fi
 			
 			
@@ -2834,7 +2834,7 @@ EOF
 					sock_send "Error = 400 Bad Request"
 					sock_send_lines "${interface_block[@]}"
 					# event-name, peer-public-key, code, message
-					emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "400" "PrefixMask configuration mismatch. Remote PrefixMask ($remote_PrefixMask) does not match local PrefixMask ($local_PrefixMask)."
+					emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "400" "PrefixMask configuration mismatch. Remote PrefixMask ($remote_PrefixMask) does not match local PrefixMask ($local_PrefixMask)." >&2
 					exit 40
 				fi
 				
@@ -2903,7 +2903,7 @@ EOF
 						echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						sock_send "Error = 500 Internal Server Error"
 						sock_send_lines "${interface_block[@]}"
-						emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "500" "Failed to update configuration for Peer ($remote_PublicKey)."
+						emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "500" "Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						exit 50
 					fi
 				fi
@@ -2915,7 +2915,7 @@ EOF
 				echo "warn: Remote[$remote_PublicKey]: Client wants to connect as a server, but is not authorized as a server. To authorize client as a server, run: $0 server allow $remote_PublicKey <<<Type=server" >&2
 				sock_send "Error = 403 Forbidden (not authorized as server)"
 				sock_send_lines "${interface_block[@]}"
-				emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "403" "Client wants to connect as a server, but is not authorized as a server."
+				emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "403" "Client wants to connect as a server, but is not authorized as a server." >&2
 				exit 43
 
 			else # assume Type=client
@@ -2950,7 +2950,7 @@ EOF
 					echo "error: Remote[$remote_PublicKey]: Local server is not currently a server (no Address mask has been specified, check configuration)." >&2
 					sock_send "Error = 503 Service Unavailable (invalid server configuration)"
 					sock_send_lines "${interface_block[@]}"
-					emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "503" "Local server is not currently a server (no Address mask has been specified, check configuration)."
+					emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "503" "Local server is not currently a server (no Address mask has been specified, check configuration)." >&2
 					exit 53
 				fi
 				
@@ -3084,7 +3084,7 @@ EOF
 						echo "error: Remote[$remote_PublicKey]: Address space exhausted, too many clients ($count)." >&2
 						sock_send "Error = 507 Insufficient Storage (address space exhausted, too many clients)"
 						sock_send_lines "${interface_block[@]}"
-						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "507" "Address space exhausted, too many clients ($count)."
+						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "507" "Address space exhausted, too many clients ($count)." >&2
 						exit 57
 					fi
 				fi
@@ -3101,7 +3101,7 @@ EOF
 						echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it already exists in the configuration as an Address or AllowedIPs ($conf_file)." >&2
 						sock_send "Error = 409 Conflict (forbidden address: $client_addr, not unique)"
 						sock_send_lines "${interface_block[@]}"
-						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it already exists in the configuration as an Address or AllowedIPs ($conf_file)."
+						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it already exists in the configuration as an Address or AllowedIPs ($conf_file)." >&2
 						exit 49
 					fi
 					
@@ -3110,7 +3110,7 @@ EOF
 							echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it ends with :: or :0." >&2
 							sock_send "Error = 409 Conflict (forbidden address: $client_addr, ends with :: or :0)"
 							sock_send_lines "${interface_block[@]}"
-							emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it ends with :: or :0."
+							emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it ends with :: or :0." >&2
 							exit 49
 						;;
 						"$local_AddressPrefix"*) ;; # this is correct, client_addr should be in the subnet of this server
@@ -3118,7 +3118,7 @@ EOF
 							echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it does not start with the server prefix ($local_AddressPrefix)." >&2
 							sock_send "Error = 409 Conflict (forbidden address: $client_addr, bad prefix)"
 							sock_send_lines "${interface_block[@]}"
-							emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it does not start with the server prefix ($local_AddressPrefix)."
+							emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it does not start with the server prefix ($local_AddressPrefix)." >&2
 							exit 49
 						;;
 					esac
@@ -3146,12 +3146,12 @@ EOF
 						# refresh Wireguard configuration
 						"$0" "$opts_interface" update "$opts_interface" >&2
 						
-						emit_server_event "$opts_interface" "client-updated" "$remote_PublicKey" "$client_addr"
+						emit_server_event "$opts_interface" "client-updated" "$remote_PublicKey" "$client_addr" >&2
 					else
 						echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						sock_send "Error = 500 Internal Server Error"
 						sock_send_lines "${interface_block[@]}"
-						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "500" "Failed to update configuration for Peer ($remote_PublicKey)."
+						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "500" "Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						exit 50
 					fi
 				fi
@@ -3234,9 +3234,9 @@ EOF
 			
 			if [ "$peer_Type" = "server" ]
 			then
-				emit_server_event "$opts_interface" "server-accepted" "$remote_PublicKey"
+				emit_server_event "$opts_interface" "server-accepted" "$remote_PublicKey" >&2
 			else
-				emit_server_event "$opts_interface" "client-accepted" "$remote_PublicKey"
+				emit_server_event "$opts_interface" "client-accepted" "$remote_PublicKey" >&2
 			fi
 		;;
 		*)
