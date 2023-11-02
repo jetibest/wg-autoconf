@@ -2789,18 +2789,24 @@ EOF
 			# check if peer_AllowedIPs matches the address from which this socket is coming from
 			# that means, that sock_authenticated will be true, if the virtual address matches
 			sock_authenticated=false
-			for allowed_ip in "${peer_AllowedIPs[@]}"
-			do
-				allowed_ip="${allowed_ip%%/*}"
-				allowed_ip="${allowed_ip%%\$*}"
-				read -r norm_allowed_ip < <(expand_ipv6 "$allowed_ip")
-				
-				if [ "$norm_allowed_ip" = "$sock_addr" ]
-				then
-					# check if the allowed_ip matches the sock_addr, if so, then sock_authenticated=true
-					sock_authenticated=true
-				fi
-			done
+			if [ "$sock_addr" = "0000:0000:0000:0000:0000:ffff:7f00:0001" ] || [ "$sock_addr" ] = "127.0.0.1" ]
+			then
+				# this is :ffff:127.0.0.1 (the local loopback address)
+				sock_authenticated=true
+			else
+				for allowed_ip in "${peer_AllowedIPs[@]}"
+				do
+					allowed_ip="${allowed_ip%%/*}"
+					allowed_ip="${allowed_ip%%\$*}"
+					read -r norm_allowed_ip < <(expand_ipv6 "$allowed_ip")
+					
+					if [ "$norm_allowed_ip" = "$sock_addr" ]
+					then
+						# check if the allowed_ip matches the sock_addr, if so, then sock_authenticated=true
+						sock_authenticated=true
+					fi
+				done
+			fi
 			
 			if [ -n "$remote_Message" ]
 			then
@@ -2810,7 +2816,7 @@ EOF
 					emit_server_event "$opts_interface" "${peer_Type:-client}-message" "$remote_PublicKey" "$remote_Message" "$remote_Data" >&2
 					exit 0
 				else
-					echo "error: Remote[$remote_PublicKey]: Received unauthenticated message from ${peer_Type:-client}: $remote_Message." >&2
+					echo "error: Remote[$remote_PublicKey]: Received unauthenticated message from ${peer_Type:-client}: $remote_Message. Remote address: $sock_addr" >&2
 					sock_send "Error = 403 Forbidden"
 					exit 43
 				fi
