@@ -2045,7 +2045,7 @@ EOF
 				while true
 				do
 					# if the remote Endpoint is a hostname,  check if it still resolves to the IP-address of the remote Endpoint
-					if [ -n "$resolved_endpoint" ] && ! getent hosts "$remote_hostname" | grep -F "$resolved_endpoint" >/dev/null 2>/dev/null
+					if [ -n "$resolved_endpoint" ] && ! getent hosts "$remote_hostname" | grep -F "$resolved_endpoint" >/dev/null 2>/dev/null && ! getent ahosts "$remote_hostname" | grep -F "$resolved_endpoint" >/dev/null 2>/dev/null
 					then
 						echo "error: Endpoint IP-address ($resolved_endpoint) is not listed by the DNS records of the remote hostname anymore ($remote_hostname)."
 						exit 78
@@ -3138,7 +3138,7 @@ EOF
 					if [ -n "$remote_VirtualHostname" ] && [ -z "$peer_VirtualHostname" ] && [ "$remote_VirtualHostname" != "localhost" ]
 					then
 						# now check if remote_VirtualHostname doesn't already exist (it must be unique, and unused, also as a public DNS)
-						if ! getent hosts "$remote_VirtualHostname" >/dev/null 2>/dev/null
+						if ! getent hosts "$remote_VirtualHostname" >/dev/null 2>/dev/null && ! getent ahosts "$remote_VirtualHostname" >/dev/null 2>/dev/null
 						then
 							auto_hostname_line="VirtualHostname = $remote_VirtualHostname"
 						fi
