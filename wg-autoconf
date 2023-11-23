@@ -2905,7 +2905,7 @@ EOF
 			# check if peer_AllowedIPs matches the address from which this socket is coming from
 			# that means, that sock_authenticated will be true, if the virtual address matches
 			sock_authenticated=false
-			if [ "$sock_addr" = "0000:0000:0000:0000:0000:ffff:7f00:0001" ] || [ "$sock_addr" ] = "127.0.0.1" ]
+			if [ "$sock_addr" = "0000:0000:0000:0000:0000:ffff:7f00:0001" ] || [ "$sock_addr" = "127.0.0.1" ]
 			then
 				# this is :ffff:127.0.0.1 (the local loopback address)
 				sock_authenticated=true
