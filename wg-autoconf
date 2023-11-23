@@ -210,6 +210,12 @@ ensure_ip6address()
 {
 	ensure_ip -6 address add "$@"
 }
+strip_ipv6_brackets()
+{
+	__strip_ipv6_brackets_addr="${1%%]*}"
+	__strip_ipv6_brackets_addr="${__strip_ipv6_brackets_addr##*[}"
+	echo "$__strip_ipv6_brackets_addr"
+}
 ensure_ipv6_brackets()
 {
 	case "$1" in
@@ -289,6 +295,83 @@ sock_receive()
 {
 	printf "%s\n" "<< $*" >&2
 }
+
+# robustly detect whether to use IPv4 or IPv6 (for systems that exclusively have either IPv4 or IPv6 connections)
+get_ip_family() # <hostname> [port], returns "tcp4" or "tcp6"
+{
+	read -r __get_ip_family_hostname < <(strip_ipv6_brackets "$1")
+	__get_ip_family_family="tcp4"
+	
+	__get_ip_family_ipv4_count=0
+	__get_ip_family_ipv6_count=0
+	
+	while read -r __get_ip_family_addr
+	do
+		case "$__get_ip_family_addr" in
+			*[:]*)
+				# is IPv6
+				__get_ip_family_ipv6_count=$((__get_ip_family_ipv6_count + 1))
+			;;
+			*[0-9][.]*)
+				# is IPv4
+				__get_ip_family_ipv4_count=$((__get_ip_family_ipv4_count + 1))
+			;;
+		esac
+		
+	done < <({ getent hosts "$__get_ip_family_hostname" 2>/dev/null; getent ahosts "$__get_ip_family_hostname" 2>/dev/null; } | awk '{print $1}' | sort -u)
+	
+	# check which family has more addresses in the given hostname (hostname can also already be IPv4 or IPv6 directly, passthrough works here)
+	if [ "$__get_ip_family_ipv4_count" -eq 0 ] && [ "$__get_ip_family_ipv6_count" -gt 0 ]
+	then
+		__get_ip_family_family="tcp6"
+		
+	elif [ "$__get_ip_family_ipv6_count" -eq 0 ] && [ "$__get_ip_family_ipv4_count" -gt 0 ]
+	then
+		__get_ip_family_family="tcp4"
+	fi
+	
+	# check with ping which family is reachable
+	case "$__get_ip_family_family" in
+		tcp4)
+			# we already assume tcp4, only change if tcp4 is not reachable, but tcp6 is
+			if ! ping -4 -c 1 -w 4 "$__get_ip_family_hostname" >/dev/null && ping -6 -c 1 -w 3 "$__get_ip_family_hostname" >/dev/null
+			then
+				__get_ip_family_family="tcp6"
+			fi
+		;;
+		tcp6)
+			# we already assume tcp6, only change if tcp6 is not reachable, but tcp4 is
+			if ! ping -6 -c 1 -w 4 "$__get_ip_family_hostname" >/dev/null && ping -4 -c 1 -w 3 "$__get_ip_family_hostname" >/dev/null
+			then
+				__get_ip_family_family="tcp4"
+			fi
+		;;
+	esac
+	
+	# detect IP-address family based on whichever connection succeeds (only if a port was provided)
+	if [ -n "$2" ]
+	then
+		# socat needs brackets around IPv6 address (only if hostname is an IPv6 address)
+		read -r __get_ip_family_hostname_socat < <(ensure_ipv6_brackets "$__get_ip_family_hostname")
+		
+		case "$__get_ip_family_family" in
+			tcp4)
+				if ! socat /dev/null tcp4:"$__get_ip_family_hostname_socat":"$2",connect-timeout=4 >/dev/null && socat /dev/null tcp6:"$__get_ip_family_hostname_socat":"$2",connect-timeout=3 >/dev/null
+				then
+					__get_ip_family_family="tcp6"
+				fi
+			;;
+			tcp6)
+				if ! socat /dev/null tcp6:"$__get_ip_family_hostname_socat":"$2",connect-timeout=4 >/dev/null && socat /dev/null tcp4:"$__get_ip_family_hostname_socat":"$2",connect-timeout=3 >/dev/null
+				then
+					__get_ip_family_family="tcp"
+				fi
+			;;
+		esac
+	fi
+	
+	echo "$__get_ip_family_family"
+}
 is_http()
 {
 	__is_http_host="$1"
@@ -301,8 +384,11 @@ is_http()
 		;;
 	esac
 	
+	# check which IP-address family to use for socat
+	read -r __is_http_ip_family < <(get_ip_family "$__is_http_host" "$__is_http_port")
+	
 	# do a HEAD request to check if we're dealing with a webserver
-	read __is_http_res _ < <(sed -r -e 's/([^\r]|^)$/\1\r/' <<EOF | socat -t"$PROTOCOL_TIMEOUT_S" - tcp:"$__is_http_host":"$__is_http_port"
+	read __is_http_res _ < <(sed -r -e 's/([^\r]|^)$/\1\r/' <<EOF | socat -t"$PROTOCOL_TIMEOUT_S" - "${__is_http_ip_family:-tcp}":"$__is_http_host":"$__is_http_port"
 HEAD / HTTP/1.1
 Host: $__is_http_host
 User-Agent: wg-autoconf/1.0
@@ -1734,7 +1820,10 @@ context_protocol()
 				echo "info: Connecting to: $connect_host:$connect_port..." >&2
 			fi
 			
-			conn_cmd=(socat -t"$PROTOCOL_TIMEOUT_S" - tcp:"$connect_host":"${connect_port:-$WIREGUARD_PORT}")
+			# check which IP-address family to use for socat
+			read -r ip_family < <(get_ip_family "$connect_host" "${connect_port:-$WIREGUARD_PORT}")
+			
+			conn_cmd=(socat -t"$PROTOCOL_TIMEOUT_S" - "${ip_family:-tcp}":"$connect_host":"${connect_port:-$WIREGUARD_PORT}")
 			if is_http "$connect_host" "${connect_port:-80}"
 			then
 				conn_cmd=(curl --data-binary @- --insecure --max-time "$PROTOCOL_TIMEOUT_S" -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:${connect_port:-80}/.well-known/wg-autoconf/")
@@ -1750,7 +1839,10 @@ context_protocol()
 				# skip over 'execute' as more readable call
 				shift
 			fi
-
+			
+			read -r opts_bind_host < <(ensure_ipv6_brackets "$opts_bind_host")
+			listen_port="${1#:}"
+			
 			tcp_listen="tcp-listen"
 			if [ "${opts_bind_host:0:1}" = "[" ]
 			then
@@ -2408,7 +2500,10 @@ EOF
 			
 			assigned_Address=()
 			
-			conn_cmd=(socat -t"$PROTOCOL_TIMEOUT_S" - tcp:"$connect_host":"$connect_port")
+			# check which IP-address family to use for socat
+			read -r ip_family < <(get_ip_family "$connect_host" "$connect_port")
+			
+			conn_cmd=(socat -t"$PROTOCOL_TIMEOUT_S" - "${ip_family:-tcp}":"$connect_host":"$connect_port")
 			if is_http "$connect_host" "$connect_port"
 			then
 				conn_cmd=(curl --data-binary @- --insecure --max-time "$PROTOCOL_TIMEOUT_S" -H 'Connection: close' --fail-with-body --location --user-agent 'wg-autoconf/1.0' "http://$connect_host:$connect_port/.well-known/wg-autoconf/")
