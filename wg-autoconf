@@ -1832,7 +1832,7 @@ context_protocol()
 			exec "${conn_cmd[@]}"
 		;;
 		listen)
-			listen_port="$1"
+			listen_port="${1#:}"
 			shift
 			if [ "$1" = "execute" ]
 			then
@@ -1841,7 +1841,6 @@ context_protocol()
 			fi
 			
 			read -r opts_bind_host < <(ensure_ipv6_brackets "$opts_bind_host")
-			listen_port="${1#:}"
 			
 			tcp_listen="tcp-listen"
 			if [ "${opts_bind_host:0:1}" = "[" ]
