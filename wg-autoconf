@@ -2771,7 +2771,10 @@ EOF
 			set_remote_Endpoint=false
 			set_remote_VirtualEndpoint=false
 			
-			while read -t "$PROTOCOL_TIMEOUT_S" -r line
+			# initially we set the (long) default protocol timeout, after receiving PublicKey, we set a shorter timeout when the first empty line is received
+			client_timeout_s="$PROTOCOL_TIMEOUT_S"
+			
+			while read -t "$client_timeout_s" -r line
 			do
 				sock_receive "$line"
 				
@@ -2807,6 +2810,14 @@ EOF
 					;;
 					Data=*)
 						read -r remote_Data <<< "${line#*=}"
+					;;
+					'')
+						# the first empty line, while the mandatory PublicKey is already provided, means that the protocol timeout will be set to a very short time
+						if [ -n "$remote_PublicKey" ]
+						then
+							# after 1 second it already times out, just so that client doesn't necessarily need to close stdin before server can continue
+							client_timeout_s="1"
+						fi
 					;;
 				esac
 				
