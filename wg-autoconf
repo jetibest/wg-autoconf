@@ -1033,6 +1033,7 @@ context_conf()
 		peer_PersistentKeepalive=""
 		peer_Type=""
 		peer_VirtualEndpoint=""
+		peer_VirtualHostname=""
 		
 		section_buffer=()
 		section=""
@@ -2442,6 +2443,7 @@ Type=server
 PublicKey=$local_PublicKey
 Message=$2
 Data=$3
+
 EOF
 		;;
 		connect)
@@ -2831,6 +2833,7 @@ EOF
 			then
 				echo "warn: Remote[$remote_PublicKey]: Bad protocol. PublicKey not given." >&2
 				sock_send "Error = 401 Unauthorized (no PublicKey in request)"
+				sock_send ""
 				if [ "$remote_Type" = "server" ]
 				then
 					emit_server_event "$opts_interface" "server-rejected" "" "401" "Unauthorized (no PublicKey in request)" >&2
@@ -2860,6 +2863,7 @@ EOF
 				echo "warn: Remote[$remote_PublicKey]: Not authorized (PublicKey = $remote_PublicKey). To authorize, run: $0 server allow $remote_PublicKey" >&2
 				sock_send "Error = 403 Forbidden"
 				sock_send_lines "${interface_block[@]}"
+				sock_send ""
 				if [ "$remote_Type" = "server" ]
 				then
 					emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "403" "Forbidden" >&2
@@ -2943,11 +2947,14 @@ EOF
 				if $sock_authenticated
 				then
 					echo "info: Remote[$remote_PublicKey]: Received message from ${peer_Type:-client}: $remote_Message with data: $remote_Data" >&2
-					emit_server_event "$opts_interface" "${peer_Type:-client}-message" "$remote_PublicKey" "$remote_Message" "$remote_Data" >&2
+					set -m # enable job control for disown
+					emit_server_event "$opts_interface" "${peer_Type:-client}-message" "$remote_PublicKey" "$remote_Message" "$remote_Data" &>/dev/null & disown
+					kill -SIGINT 0
 					exit 0
 				else
 					echo "error: Remote[$remote_PublicKey]: Received unauthenticated message from ${peer_Type:-client}: $remote_Message. Remote address: $sock_addr" >&2
 					sock_send "Error = 403 Forbidden"
+					sock_send ""
 					exit 43
 				fi
 				
@@ -2973,6 +2980,7 @@ EOF
 					echo "error: Remote[$remote_PublicKey]: PrefixMask configuration mismatch. Remote PrefixMask ($remote_PrefixMask) does not match local PrefixMask ($local_PrefixMask)." >&2
 					sock_send "Error = 400 Bad Request"
 					sock_send_lines "${interface_block[@]}"
+					sock_send ""
 					# event-name, peer-public-key, code, message
 					emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "400" "PrefixMask configuration mismatch. Remote PrefixMask ($remote_PrefixMask) does not match local PrefixMask ($local_PrefixMask)." >&2
 					exit 40
@@ -3043,6 +3051,7 @@ EOF
 						echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						sock_send "Error = 500 Internal Server Error"
 						sock_send_lines "${interface_block[@]}"
+						sock_send ""
 						emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "500" "Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						exit 50
 					fi
@@ -3055,6 +3064,7 @@ EOF
 				echo "warn: Remote[$remote_PublicKey]: Client wants to connect as a server, but is not authorized as a server. To authorize client as a server, run: $0 server allow $remote_PublicKey <<<Type=server" >&2
 				sock_send "Error = 403 Forbidden (not authorized as server)"
 				sock_send_lines "${interface_block[@]}"
+				sock_send ""
 				emit_server_event "$opts_interface" "server-rejected" "$remote_PublicKey" "403" "Client wants to connect as a server, but is not authorized as a server." >&2
 				exit 43
 
@@ -3090,6 +3100,7 @@ EOF
 					echo "error: Remote[$remote_PublicKey]: Local server is not currently a server (no Address mask has been specified, check configuration)." >&2
 					sock_send "Error = 503 Service Unavailable (invalid server configuration)"
 					sock_send_lines "${interface_block[@]}"
+					sock_send ""
 					emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "503" "Local server is not currently a server (no Address mask has been specified, check configuration)." >&2
 					exit 53
 				fi
@@ -3224,6 +3235,7 @@ EOF
 						echo "error: Remote[$remote_PublicKey]: Address space exhausted, too many clients ($count)." >&2
 						sock_send "Error = 507 Insufficient Storage (address space exhausted, too many clients)"
 						sock_send_lines "${interface_block[@]}"
+						sock_send ""
 						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "507" "Address space exhausted, too many clients ($count)." >&2
 						exit 57
 					fi
@@ -3241,6 +3253,7 @@ EOF
 						echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it already exists in the configuration as an Address or AllowedIPs ($conf_file)." >&2
 						sock_send "Error = 409 Conflict (forbidden address: $client_addr, not unique)"
 						sock_send_lines "${interface_block[@]}"
+						sock_send ""
 						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it already exists in the configuration as an Address or AllowedIPs ($conf_file)." >&2
 						exit 49
 					fi
@@ -3250,6 +3263,7 @@ EOF
 							echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it ends with :: or :0." >&2
 							sock_send "Error = 409 Conflict (forbidden address: $client_addr, ends with :: or :0)"
 							sock_send_lines "${interface_block[@]}"
+							sock_send ""
 							emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it ends with :: or :0." >&2
 							exit 49
 						;;
@@ -3258,6 +3272,7 @@ EOF
 							echo "error: Remote[$remote_PublicKey]: Forbidden address ($client_addr), it does not start with the server prefix ($local_AddressPrefix)." >&2
 							sock_send "Error = 409 Conflict (forbidden address: $client_addr, bad prefix)"
 							sock_send_lines "${interface_block[@]}"
+							sock_send ""
 							emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "409" "Forbidden address ($client_addr), it does not start with the server prefix ($local_AddressPrefix)." >&2
 							exit 49
 						;;
@@ -3279,6 +3294,7 @@ EOF
 Type = client
 AllowedIPs = $client_addr
 $auto_hostname_line
+
 EOF
 					then
 						echo "info: Remote[$remote_PublicKey]: Configuration updated. Peer (PublicKey = $remote_PublicKey) added with virtual IP-address: $client_addr" >&2
@@ -3291,6 +3307,7 @@ EOF
 						echo "error: Remote[$remote_PublicKey]: Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						sock_send "Error = 500 Internal Server Error"
 						sock_send_lines "${interface_block[@]}"
+						sock_send ""
 						emit_server_event "$opts_interface" "client-rejected" "$remote_PublicKey" "500" "Failed to update configuration for Peer ($remote_PublicKey)." >&2
 						exit 50
 					fi
@@ -3371,6 +3388,8 @@ EOF
 				sock_send "$line"
 				
 			done < <("$0" "$opts_interface" conf get-peer "$remote_PublicKey")
+			
+			sock_send ""
 			
 			if [ "$peer_Type" = "server" ]
 			then
