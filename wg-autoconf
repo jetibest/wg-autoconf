@@ -1875,7 +1875,11 @@ context_protocol()
 				esac
 			fi
 			
-			{ echo "$line"; cat; } | "$@"
+			# kill -SIGINT 0 stops cat when $@ is done executing, 0 refers to the process group that the pipeline is in
+			# set -m is to enable job control (new process groups), to ensure socat listening instance is not killed
+
+			set -m
+			{ echo "$line"; cat; } | { "$@"; kill -SIGINT 0; }
 		;;
 	esac
 	
