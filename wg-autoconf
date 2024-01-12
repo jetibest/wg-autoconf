@@ -2171,7 +2171,7 @@ EOF
 					# check last handshake connection
 					read -r last_handshake < <("$0" "$opts_interface" show "$opts_interface" latest-handshakes | awk '$1=="'"$remote_PublicKey"'"{print $2}')
 					read -r cur_time < <(date +'%s')
-					if [ -n "$last_handshake" ]
+					if [ -n "$last_handshake" ] && [ "$last_handshake" -gt 0 ]
 					then
 						last_confirmed_handshake="$last_handshake"
 						
