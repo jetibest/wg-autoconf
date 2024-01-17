@@ -20,7 +20,8 @@ PROTOCOL_TIMEOUT_S="20"
 DEFAULT_METRIC="1024"
 
 # higher MTU is better for performance, MTU is min 1280, and typically max 1500, Wireguard UDP header needs 80 bytes so 1420 would be suggested, if MTU is too high, all or some packets may drop, 1400 is a more safe value
-DEFAULT_MTU="1400"
+# (tested: MTU 1400 does not work via EWON router, but 1300 does)
+DEFAULT_MTU="1280"
 
 # Sensible default values:
 DEFAULT_VPN_PREFIX="fd77:1"
@@ -768,8 +769,8 @@ context_wg()
 				# ensure default policy of ip6tables is to DROP, unless caught by any filter chain
 				cmd ip6tables -P FORWARD DROP
 				
-				# create link device (tested: MTU 1400 does not work via EWON router, but 1300 does)
-				cmd ip link add "$opts_interface" mtu 1300 type wireguard
+				# create link device
+				cmd ip link add "$opts_interface" type wireguard
 			fi
 			
 			# apply ip6tables rules before the device is up, but after device is created
