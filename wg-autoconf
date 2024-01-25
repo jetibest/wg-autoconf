@@ -1071,6 +1071,7 @@ context_conf()
 			[ -z "$peer_PublicKey" ] || printf '%s\n' "PublicKey = $peer_PublicKey"
 			[ -z "$peer_Endpoint" ] || printf '%s\n' "Endpoint = $peer_Endpoint"
 			[ -z "$peer_VirtualEndpoint" ] || printf '%s\n' "VirtualEndpoint = $peer_VirtualEndpoint"
+			[ -z "$peer_VirtualHostname" ] || printf '%s\n' "VirtualHostname = $peer_VirtualHostname"
 			if [ "${#peer_AllowedIPs[@]}" -gt 0 ]
 			then
 				for allowed_ip in "${peer_AllowedIPs[@]}"
